@@ -1,0 +1,17 @@
+README.md
+pyproject.toml
+src/harness/__init__.py
+src/harness/config.py
+src/harness/logging.py
+src/harness/main.py
+src/harness/core/__init__.py
+src/harness/orchestration/__init__.py
+src/harness/persistence/__init__.py
+src/harness/prompts/__init__.py
+src/harness/tools/__init__.py
+src/sophisticated_agent_harness.egg-info/PKG-INFO
+src/sophisticated_agent_harness.egg-info/SOURCES.txt
+src/sophisticated_agent_harness.egg-info/dependency_links.txt
+src/sophisticated_agent_harness.egg-info/entry_points.txt
+src/sophisticated_agent_harness.egg-info/requires.txt
+src/sophisticated_agent_harness.egg-info/top_level.txt

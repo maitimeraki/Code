@@ -1,0 +1,38 @@
+Metadata-Version: 2.4
+Name: sophisticated-agent-harness
+Version: 0.1.0
+Summary: Self-improving agent orchestration harness with autonomous loop execution
+Author-email: Anupam <anupam@example.com>
+License: MIT
+Requires-Python: >=3.11
+Requires-Dist: asyncio-contextmanager
+Requires-Dist: uvloop>=0.17.0
+Requires-Dist: litellm>=1.0.0
+Requires-Dist: anthropic>=0.7.0
+Requires-Dist: openai>=1.0.0
+Requires-Dist: tenacity>=8.2.3
+Requires-Dist: aiofiles>=23.2.1
+Requires-Dist: httpx>=0.25.0
+Requires-Dist: asyncpg>=0.28.0
+Requires-Dist: sqlalchemy[asyncio]>=2.0.0
+Requires-Dist: pydantic>=2.0.0
+Requires-Dist: pydantic-settings>=2.0.0
+Requires-Dist: msgpack>=1.0.7
+Requires-Dist: jinja2>=3.1.2
+Requires-Dist: rank-bm25>=0.2.2
+Requires-Dist: networkx>=3.1
+Requires-Dist: structlog>=23.1.0
+Requires-Dist: prometheus-client>=0.17.1
+Requires-Dist: typer[all]>=0.9.0
+Requires-Dist: python-dotenv>=1.0.0
+Provides-Extra: dev
+Requires-Dist: pytest>=7.4.0; extra == "dev"
+Requires-Dist: pytest-asyncio>=0.21.0; extra == "dev"
+Requires-Dist: pytest-cov>=4.1.0; extra == "dev"
+Requires-Dist: ruff>=0.1.0; extra == "dev"
+Requires-Dist: black>=23.10.0; extra == "dev"
+Requires-Dist: mypy>=1.5.0; extra == "dev"
+Provides-Extra: optional
+Requires-Dist: sentence-transformers>=2.2.2; extra == "optional"
+Requires-Dist: redis>=5.0.0; extra == "optional"
+Requires-Dist: diskcache>=5.6.1; extra == "optional"
