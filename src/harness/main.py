@@ -12,26 +12,30 @@ from harness.logging import configure_logging, get_logger
 from harness.core.task_manager import TaskStateManager
 from harness.core.loop import LoopController
 from harness.core.completion import CompletionChecker
+from harness.app import HarnessApp
 
-app = typer.Typer(help="Sophisticated Agent Harness CLI")
+app = typer.Typer(help="Sophisticated Agent Harness")
 console = Console()
 logger = get_logger(__name__)
 
 
-@app.command()
-def plan(
-    task: str = typer.Argument(..., help="Task description"),
-    output: Optional[Path] = typer.Option(None, help="Save plan to file"),
-) -> None:
-    """Plan a new task using Architect agent."""
+@app.callback(invoke_without_command=True)
+@typer.pass_context
+def main_app(ctx: typer.Context) -> None:
+    """
+    🤖 Sophisticated Agent Harness
+
+    Autonomous multi-agent orchestration system.
+
+    Run with no arguments for interactive mode, or use commands for CLI mode.
+    """
     settings = get_settings()
     configure_logging(settings.log_level)
 
-    logger.info("Planning task", task=task)
-    console.print(f"[bold cyan]Planning:[/bold cyan] {task}")
-
-    # Phase 1 hook: Will spawn Architect agent
-    console.print("[yellow]Not yet implemented - awaiting Phase 1 (Orchestration)[/yellow]")
+    # If no command, show interactive UI
+    if ctx.invoked_subcommand is None:
+        app_instance = HarnessApp()
+        asyncio.run(app_instance.run())
 
 
 @app.command()
