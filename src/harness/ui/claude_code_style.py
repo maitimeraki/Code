@@ -32,16 +32,26 @@ class Styles:
 
 def create_console() -> Console:
     """Create Rich console with Claude Code styling."""
-    import os
     import sys
+    import io
 
-    # Force UTF-8 on Windows
+    # Force UTF-8 on Windows - wrap stdout with UTF-8 encoding
     if sys.platform == "win32":
-        os.environ["PYTHONIOENCODING"] = "utf-8"
         try:
+            # Reconfigure stdout to use UTF-8
+            if hasattr(sys.stdout, 'reconfigure'):
+                sys.stdout.reconfigure(encoding='utf-8')
+            else:
+                sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+
+            # Enable VT100 console mode for ANSI colors
             import ctypes
             kernel = ctypes.windll.kernel32
-            kernel.SetConsoleMode(kernel.GetStdHandle(-11), 7)
+            handle = kernel.GetStdHandle(-11)
+            mode = ctypes.c_ulong()
+            kernel.GetConsoleMode(handle, ctypes.byref(mode))
+            mode.value |= 0x0004  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+            kernel.SetConsoleMode(handle, mode)
         except Exception:
             pass
 
