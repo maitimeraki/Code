@@ -9,6 +9,9 @@ from rich.console import Console
 
 from harness.config import get_settings
 from harness.logging import configure_logging, get_logger
+from harness.core.task_manager import TaskStateManager
+from harness.core.loop import LoopController
+from harness.core.completion import CompletionChecker
 
 app = typer.Typer(help="Sophisticated Agent Harness CLI")
 console = Console()
@@ -33,33 +36,79 @@ def plan(
 
 @app.command()
 def run(
-    task_id: str = typer.Option(..., help="Task ID to run"),
+    task_description: str = typer.Option(..., "--task", "-t", help="Task description"),
     max_iterations: int = typer.Option(10, help="Max loop iterations"),
 ) -> None:
-    """Run a task using the orchestration loop."""
+    """Run a new task using the orchestration loop."""
     settings = get_settings()
     configure_logging(settings.log_level)
 
-    logger.info("Running task", task_id=task_id, max_iterations=max_iterations)
-    console.print(f"[bold green]Running:[/bold green] {task_id}")
+    async def async_run():
+        manager = TaskStateManager(settings.data_dir)
+        controller = LoopController(settings.data_dir)
 
-    # Phase 1 hook: Will enter LoopController
-    console.print("[yellow]Not yet implemented - awaiting Phase 1 (Loop Engine)[/yellow]")
+        console.print(f"[bold green]Starting task:[/bold green] {task_description}")
+
+        state = await manager.create_task(
+            description=task_description,
+            success_criteria={},  # Phase 2 will add criteria
+            max_iterations=max_iterations,
+        )
+
+        # Phase 2 will register actual handlers (spawn agents, call tools, etc.)
+        # For now, dummy handler increments iteration count
+        async def dummy_work(s):
+            s.results["status"] = f"Iteration {s.iteration} completed"
+            console.print(f"  Iteration {s.iteration}/{max_iterations}")
+
+        controller.register_handler("execute", dummy_work)
+
+        # Phase 2 will define meaningful completion criteria
+        checker = CompletionChecker.create_simple({})
+
+        result = await controller.run(state, checker)
+
+        console.print(f"[bold blue]Task completed:[/bold blue] {result.task_id}")
+        console.print(f"  Status: {result.status.value}")
+        console.print(f"  Iterations: {result.iteration}")
+        console.print(f"  Exit reason: {result.exit_condition.value if result.exit_condition else 'N/A'}")
+
+    asyncio.run(async_run())
 
 
 @app.command()
 def resume(
-    task_id: str = typer.Option(..., help="Task ID to resume"),
+    task_id: str = typer.Option(..., "--task-id", "-id", help="Task ID to resume"),
 ) -> None:
     """Resume a paused task from checkpoint."""
     settings = get_settings()
     configure_logging(settings.log_level)
 
-    logger.info("Resuming task", task_id=task_id)
-    console.print(f"[bold blue]Resuming:[/bold blue] {task_id}")
+    async def async_resume():
+        manager = TaskStateManager(settings.data_dir)
+        controller = LoopController(settings.data_dir)
 
-    # Phase 1 hook: Will restore from checkpoint
-    console.print("[yellow]Not yet implemented - awaiting Phase 1 (Checkpoint System)[/yellow]")
+        state = await manager.load_state(task_id)
+        if not state:
+            console.print(f"[red]Error:[/red] No checkpoint found for task {task_id}")
+            return
+
+        console.print(f"[bold blue]Resuming:[/bold blue] {task_id}")
+        console.print(f"  From iteration: {state.iteration}")
+
+        # Phase 2: Will register actual handlers
+        async def dummy_work(s):
+            s.results["status"] = f"Iteration {s.iteration} completed"
+
+        controller.register_handler("execute", dummy_work)
+        checker = CompletionChecker.create_simple({})
+
+        result = await controller.resume(task_id, checker)
+
+        console.print(f"[bold blue]Task completed:[/bold blue] {result.task_id}")
+        console.print(f"  Final iteration: {result.iteration}")
+
+    asyncio.run(async_resume())
 
 
 @app.command()
@@ -68,11 +117,22 @@ def status() -> None:
     settings = get_settings()
     configure_logging(settings.log_level)
 
-    logger.info("Fetching task status")
-    console.print("[bold]Active Tasks:[/bold]")
+    async def async_status():
+        manager = TaskStateManager(settings.data_dir)
+        task_ids = await manager.list_tasks()
 
-    # Phase 5 hook: Will query persistence layer
-    console.print("[yellow]Not yet implemented - awaiting Phase 5 (Persistence)[/yellow]")
+        console.print("[bold]Active Tasks:[/bold]")
+        if not task_ids:
+            console.print("  (none)")
+            return
+
+        for task_id in task_ids:
+            state = await manager.load_state(task_id)
+            if state:
+                console.print(f"  {task_id[:8]}... - {state.description}")
+                console.print(f"    Status: {state.status.value}, Iteration: {state.iteration}/{state.max_iterations}")
+
+    asyncio.run(async_status())
 
 
 @app.command()
