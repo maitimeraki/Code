@@ -17,6 +17,8 @@ class InputBarState:
     hint: str = "< for agents"
     in_palette_mode: bool = False
     palette_buffer: str = ""
+    in_task_mode: bool = False
+    in_search_mode: bool = False
 
 
 class InputBar:

@@ -13,6 +13,7 @@ from .state import UIState
 from .keybinds import KeybindMap
 from .input_handler import InputHandler, KeyEvent
 from .command_palette import CommandPalette
+from .command_actions import CommandActions
 from .stream_listener import StreamListener, LogEntry
 from .stream_aggregator import StreamAggregator
 from .renderers import OutputRenderer
@@ -37,6 +38,28 @@ class TerminalUI:
         # Phase 2C: Real-time streams
         self.stream_listener = StreamListener()
         self.stream_aggregator = StreamAggregator(self.stream_listener)
+
+        # Phase 2E: Command actions
+        self.command_actions = CommandActions(self)
+        self._wire_command_handlers()
+
+    def _wire_command_handlers(self) -> None:
+        """Wire command actions to palette commands."""
+        handler_map = {
+            ":run-task": self.command_actions.run_task,
+            ":pause": self.command_actions.pause,
+            ":resume": self.command_actions.resume,
+            ":cancel": self.command_actions.cancel,
+            ":search-logs": self.command_actions.search_logs,
+            ":clear": self.command_actions.clear,
+            ":export": self.command_actions.export,
+            ":help": self.command_actions.help,
+            ":quit": self.command_actions.quit,
+        }
+
+        for cmd in self.command_palette.commands:
+            if cmd.shortcut in handler_map:
+                cmd.handler = handler_map[cmd.shortcut]
 
     def _setup_signal_handlers(self) -> None:
         """Setup terminal signal handlers."""

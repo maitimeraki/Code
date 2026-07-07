@@ -22,6 +22,9 @@ from .stream_aggregator import StreamAggregator
 from .agent_view import AgentView, Agent, AgentStatus
 from .tool_view import ToolView, ToolCall, ToolStatus
 
+# Phase 2E - Command Actions
+from .command_actions import CommandActions
+
 __all__ = [
     # Phase 2A
     "Colors", "Styles", "create_console",
@@ -38,6 +41,8 @@ __all__ = [
     # Phase 2D
     "AgentView", "Agent", "AgentStatus",
     "ToolView", "ToolCall", "ToolStatus",
+    # Phase 2E
+    "CommandActions",
 ]
 
 
