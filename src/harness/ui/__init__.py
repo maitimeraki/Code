@@ -9,6 +9,9 @@ from .terminal import TerminalUI
 from .keybinds import KeybindMap, KeyCode
 from .input_handler import InputHandler, KeyEvent
 from .command_palette import CommandPalette
+from .stream_listener import StreamListener, LogEntry, LogLevel
+from .renderers import OutputRenderer
+from .stream_aggregator import StreamAggregator
 
 __all__ = [
     "Colors",
@@ -24,5 +27,11 @@ __all__ = [
     "InputHandler",
     "KeyEvent",
     "CommandPalette",
+    "StreamListener",
+    "LogEntry",
+    "LogLevel",
+    "OutputRenderer",
+    "StreamAggregator",
 ]
+
 

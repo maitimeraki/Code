@@ -31,6 +31,10 @@ class TerminalUI:
         self.input_handler = InputHandler(self.keybinds)
         self.command_palette = CommandPalette()
 
+        # Phase 2C: Real-time streams
+        self.stream_listener = StreamListener()
+        self.stream_aggregator = StreamAggregator(self.stream_listener)
+
     def _setup_signal_handlers(self) -> None:
         """Setup terminal signal handlers."""
         def handle_sigint(signum, frame):
@@ -104,10 +108,84 @@ class TerminalUI:
         self.input_handler.register_handler("cancel", on_cancel)
         self.input_handler.register_handler("quit", on_quit)
 
+    def _setup_stream_handlers(self) -> None:
+        """Setup stream batch handler to update UI."""
+        async def on_batch(entries: list[LogEntry]):
+            """Handle a batch of log entries."""
+            for entry in entries:
+                rendered = OutputRenderer.render_log_entry(entry)
+                self.main_panel.add_text(rendered)
+
+        self.stream_aggregator.register_batch_handler(on_batch)
+        """Setup keyboard input handlers for actions."""
+        async def on_submit_input(event: KeyEvent):
+            """Handle Enter key - submit input."""
+            text = self.input_bar.get_current_input()
+
+            if self.input_bar.state.in_palette_mode:
+                # Execute command
+                cmd = self.command_palette.get_command(text)
+                if cmd:
+                    self.main_panel.add_success(f"Executing: {cmd.description}")
+                    if cmd.handler:
+                        await cmd.handler()
+                self.input_bar.exit_palette_mode()
+            else:
+                # Regular prompt
+                if text:
+                    self.input_bar.add_to_history(text)
+                    self.main_panel.add_info(f"Prompt: {text}")
+                    self.input_bar.clear()
+
+        async def on_delete_char(event: KeyEvent):
+            """Handle Backspace - delete character."""
+            self.input_bar.delete_char()
+
+        async def on_history_prev(event: KeyEvent):
+            """Handle Up arrow - previous history."""
+            prev = self.input_bar.get_previous()
+            if prev is not None:
+                self.input_bar.set_buffer(prev)
+
+        async def on_history_next(event: KeyEvent):
+            """Handle Down arrow - next history."""
+            next_input = self.input_bar.get_next()
+            if next_input is not None:
+                self.input_bar.set_buffer(next_input)
+
+        async def on_open_palette(event: KeyEvent):
+            """Handle Ctrl+K - open command palette."""
+            self.input_bar.enter_palette_mode()
+
+        async def on_clear_screen(event: KeyEvent):
+            """Handle Ctrl+L - clear main panel."""
+            self.main_panel.clear()
+
+        async def on_cancel(event: KeyEvent):
+            """Handle Ctrl+C - cancel operation."""
+            self.state.pause()
+            self.main_panel.add_error("Operation cancelled")
+
+        async def on_quit(event: KeyEvent):
+            """Handle Ctrl+D - quit."""
+            self.state.shutdown()
+            self.running = False
+
+        # Register handlers
+        self.input_handler.register_handler("submit_input", on_submit_input)
+        self.input_handler.register_handler("delete_char", on_delete_char)
+        self.input_handler.register_handler("history_prev", on_history_prev)
+        self.input_handler.register_handler("history_next", on_history_next)
+        self.input_handler.register_handler("open_palette", on_open_palette)
+        self.input_handler.register_handler("clear_screen", on_clear_screen)
+        self.input_handler.register_handler("cancel", on_cancel)
+        self.input_handler.register_handler("quit", on_quit)
+
     def initialize(self) -> None:
         """Initialize the UI."""
         self._setup_signal_handlers()
         self._setup_input_handlers()
+        self._setup_stream_handlers()
 
         self.status_bar.update(StatusInfo(
             project_name="Agent Harness",
@@ -122,7 +200,7 @@ class TerminalUI:
         self.main_panel.add_line("Use arrow keys for input history")
         self.main_panel.add_line("Type a prompt and press Enter to start")
         self.main_panel.add_line("")
-        self.main_panel.add_info("Phase 2B: Keyboard Input Active")
+        self.main_panel.add_info("Phase 2C: Real-Time Stream Integration Active")
 
     def render_layout(self) -> Layout:
         """Create layout with status bar, main panel, and input bar."""
@@ -192,11 +270,12 @@ class TerminalUI:
         """Run the terminal UI."""
         self.initialize()
 
-        # Run input and display loops concurrently
+        # Run input, display, and stream loops concurrently
         try:
             await asyncio.gather(
                 self.input_loop(),
                 self.display_loop(),
+                self.stream_aggregator.start(),
                 return_exceptions=True
             )
         except KeyboardInterrupt:
