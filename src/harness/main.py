@@ -14,28 +14,27 @@ from harness.core.loop import LoopController
 from harness.core.completion import CompletionChecker
 from harness.app import HarnessApp
 
-app = typer.Typer(help="Sophisticated Agent Harness")
+app = typer.Typer(help="Agent Harness")
 console = Console()
 logger = get_logger(__name__)
 
 
-@app.callback(invoke_without_command=True)
-@typer.pass_context
-def main_app(ctx: typer.Context) -> None:
-    """
-    🤖 Sophisticated Agent Harness
+def main() -> None:
+    """Main entry point."""
+    import sys
+    known_commands = {"run", "resume", "status", "knowledge-search", "init", "--help", "-h", "--version"}
 
-    Autonomous multi-agent orchestration system.
-
-    Run with no arguments for interactive mode, or use commands for CLI mode.
-    """
-    settings = get_settings()
-    configure_logging(settings.log_level)
-
-    # If no command, show interactive UI
-    if ctx.invoked_subcommand is None:
+    # If no command args, launch interactive UI
+    has_command = any(arg in known_commands for arg in sys.argv[1:])
+    if not has_command:
+        settings = get_settings()
+        configure_logging(settings.log_level)
         app_instance = HarnessApp()
         asyncio.run(app_instance.run())
+        return
+
+    # Otherwise use Typer CLI
+    app()
 
 
 @app.command()
@@ -199,6 +198,19 @@ LOG_LEVEL=info
 
 def main() -> None:
     """Main entry point."""
+    import sys
+    known_commands = {"run", "resume", "status", "knowledge-search", "init", "--help", "-h", "--version"}
+
+    # If no command args, launch interactive UI
+    has_command = any(arg in known_commands for arg in sys.argv[1:])
+    if not has_command:
+        settings = get_settings()
+        configure_logging(settings.log_level)
+        app_instance = HarnessApp()
+        asyncio.run(app_instance.run())
+        return
+
+    # Otherwise use Typer CLI
     app()
 
 
