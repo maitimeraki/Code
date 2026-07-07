@@ -4,5 +4,25 @@ from .claude_code_style import Colors, Styles, create_console
 from .statusbar import StatusBar
 from .main_panel import MainPanel
 from .input_bar import InputBar
+from .state import UIState
+from .terminal import TerminalUI
+from .keybinds import KeybindMap, KeyCode
+from .input_handler import InputHandler, KeyEvent
+from .command_palette import CommandPalette
 
-__all__ = ["Colors", "Styles", "create_console", "StatusBar", "MainPanel", "InputBar"]
+__all__ = [
+    "Colors",
+    "Styles",
+    "create_console",
+    "StatusBar",
+    "MainPanel",
+    "InputBar",
+    "UIState",
+    "TerminalUI",
+    "KeybindMap",
+    "KeyCode",
+    "InputHandler",
+    "KeyEvent",
+    "CommandPalette",
+]
+

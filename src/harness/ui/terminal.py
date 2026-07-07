@@ -10,6 +10,9 @@ from .statusbar import StatusBar, StatusInfo
 from .main_panel import MainPanel
 from .input_bar import InputBar
 from .state import UIState
+from .keybinds import KeybindMap
+from .input_handler import InputHandler, KeyEvent
+from .command_palette import CommandPalette
 
 
 class TerminalUI:
@@ -23,6 +26,11 @@ class TerminalUI:
         self.state = UIState()
         self.running = True
 
+        # Phase 2B: Keyboard input
+        self.keybinds = KeybindMap()
+        self.input_handler = InputHandler(self.keybinds)
+        self.command_palette = CommandPalette()
+
     def _setup_signal_handlers(self) -> None:
         """Setup terminal signal handlers."""
         def handle_sigint(signum, frame):
@@ -31,9 +39,75 @@ class TerminalUI:
 
         signal.signal(signal.SIGINT, handle_sigint)
 
+    def _setup_input_handlers(self) -> None:
+        """Setup keyboard input handlers for actions."""
+        async def on_submit_input(event: KeyEvent):
+            """Handle Enter key - submit input."""
+            text = self.input_bar.get_current_input()
+
+            if self.input_bar.state.in_palette_mode:
+                # Execute command
+                cmd = self.command_palette.get_command(text)
+                if cmd:
+                    self.main_panel.add_success(f"Executing: {cmd.description}")
+                    if cmd.handler:
+                        await cmd.handler()
+                self.input_bar.exit_palette_mode()
+            else:
+                # Regular prompt
+                if text:
+                    self.input_bar.add_to_history(text)
+                    self.main_panel.add_info(f"Prompt: {text}")
+                    self.input_bar.clear()
+
+        async def on_delete_char(event: KeyEvent):
+            """Handle Backspace - delete character."""
+            self.input_bar.delete_char()
+
+        async def on_history_prev(event: KeyEvent):
+            """Handle Up arrow - previous history."""
+            prev = self.input_bar.get_previous()
+            if prev is not None:
+                self.input_bar.set_buffer(prev)
+
+        async def on_history_next(event: KeyEvent):
+            """Handle Down arrow - next history."""
+            next_input = self.input_bar.get_next()
+            if next_input is not None:
+                self.input_bar.set_buffer(next_input)
+
+        async def on_open_palette(event: KeyEvent):
+            """Handle Ctrl+K - open command palette."""
+            self.input_bar.enter_palette_mode()
+
+        async def on_clear_screen(event: KeyEvent):
+            """Handle Ctrl+L - clear main panel."""
+            self.main_panel.clear()
+
+        async def on_cancel(event: KeyEvent):
+            """Handle Ctrl+C - cancel operation."""
+            self.state.pause()
+            self.main_panel.add_error("Operation cancelled")
+
+        async def on_quit(event: KeyEvent):
+            """Handle Ctrl+D - quit."""
+            self.state.shutdown()
+            self.running = False
+
+        # Register handlers
+        self.input_handler.register_handler("submit_input", on_submit_input)
+        self.input_handler.register_handler("delete_char", on_delete_char)
+        self.input_handler.register_handler("history_prev", on_history_prev)
+        self.input_handler.register_handler("history_next", on_history_next)
+        self.input_handler.register_handler("open_palette", on_open_palette)
+        self.input_handler.register_handler("clear_screen", on_clear_screen)
+        self.input_handler.register_handler("cancel", on_cancel)
+        self.input_handler.register_handler("quit", on_quit)
+
     def initialize(self) -> None:
         """Initialize the UI."""
         self._setup_signal_handlers()
+        self._setup_input_handlers()
 
         self.status_bar.update(StatusInfo(
             project_name="Agent Harness",
@@ -42,18 +116,13 @@ class TerminalUI:
             version="0.1.0",
         ))
 
-        self.main_panel.add_section(
-            "Welcome back!",
-            ""
-        )
-
+        self.main_panel.add_section("Welcome back!", "")
         self.main_panel.add_info("Tips for getting started")
-        self.main_panel.add_line("Run /init to create a CLAUDE.md file with instructions for Claude")
-        self.main_panel.add_line("What's new: Phase 2A - Claude Code-style Terminal UI")
+        self.main_panel.add_line("Press Ctrl+K to open command palette")
+        self.main_panel.add_line("Use arrow keys for input history")
+        self.main_panel.add_line("Type a prompt and press Enter to start")
         self.main_panel.add_line("")
-
-        self.main_panel.add_info("Live activity: http://localhost:37777")
-        self.main_panel.add_info("How it works: Type a prompt and press Enter")
+        self.main_panel.add_info("Phase 2B: Keyboard Input Active")
 
     def render_layout(self) -> Layout:
         """Create layout with status bar, main panel, and input bar."""
@@ -79,6 +148,32 @@ class TerminalUI:
 
         return layout
 
+    async def input_loop(self) -> None:
+        """Main keyboard input loop."""
+        while self.running and self.state.is_running:
+            try:
+                key = await self.input_handler.read_key()
+                if key is None:
+                    await asyncio.sleep(0.01)
+                    continue
+
+                # Handle text input
+                if self.input_handler.is_text_input(key):
+                    if self.input_bar.state.in_palette_mode:
+                        self.input_bar.state.palette_buffer += key
+                    else:
+                        self.input_bar.add_char(key)
+                else:
+                    # Handle control keys
+                    await self.input_handler.handle_key(key)
+
+                await asyncio.sleep(0.001)
+            except KeyboardInterrupt:
+                self.state.shutdown()
+                break
+            except Exception:
+                await asyncio.sleep(0.01)
+
     async def display_loop(self) -> None:
         """Main UI display loop."""
         while self.running and self.state.is_running:
@@ -86,28 +181,28 @@ class TerminalUI:
                 layout = self.render_layout()
                 self.console.clear()
                 self.console.print(layout)
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(0.05)  # 20 FPS
             except KeyboardInterrupt:
                 self.state.shutdown()
                 break
-            except Exception as e:
-                self.main_panel.add_error(f"Error: {str(e)}")
-
-    async def get_user_input(self) -> Optional[str]:
-        """Get user input (Phase 2B will enhance)."""
-        try:
-            text = await self.input_bar.get_input()
-            if text:
-                self.input_bar.add_to_history(text)
-                self.input_bar.clear()
-            return text
-        except EOFError:
-            return None
+            except Exception:
+                await asyncio.sleep(0.05)
 
     async def run(self) -> None:
         """Run the terminal UI."""
         self.initialize()
-        await self.display_loop()
+
+        # Run input and display loops concurrently
+        try:
+            await asyncio.gather(
+                self.input_loop(),
+                self.display_loop(),
+                return_exceptions=True
+            )
+        except KeyboardInterrupt:
+            self.state.shutdown()
+        finally:
+            self.shutdown()
 
     def display_once(self) -> None:
         """Render UI once (for testing)."""
@@ -141,3 +236,4 @@ class TerminalUI:
         self.state.shutdown()
         self.running = False
         self.console.print("[cyan]Goodbye![/cyan]")
+
