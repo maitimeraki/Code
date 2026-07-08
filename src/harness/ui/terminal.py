@@ -222,7 +222,7 @@ class TerminalUI:
             try:
                 if self._dirty:
                     layout = self.render_layout()
-                    self._live.update(layout, refresh=True)
+                    self._live.update(layout)
                     self._dirty = False
                 await asyncio.sleep(0.05)
             except KeyboardInterrupt:
@@ -237,10 +237,8 @@ class TerminalUI:
         initial_layout = self.render_layout()
 
         # Run with Live for flicker-free rendering
-        with Live(initial_layout, console=self.console, auto_refresh=False, screen=False) as live:
+        with Live(initial_layout, console=self.console, auto_refresh=True, refresh_per_second=20, screen=False) as live:
             self._live = live
-            # Force initial render display
-            live.update(initial_layout, refresh=True)
 
             # Run input, display, and stream loops concurrently
             try:
