@@ -13,6 +13,7 @@ class KeyCode(Enum):
     CTRL_K = "\x0b"
     CTRL_L = "\x0c"
     CTRL_D = "\x04"
+    CTRL_H = "\x08"  # Backspace on Windows
     TAB = "\t"
     BACKSPACE = "\x7f"
     UP = "\x1b[A"
@@ -46,6 +47,7 @@ class KeybindMap:
         # Input manipulation
         self.register(KeyCode.ENTER.value, "submit_input", "Submit input prompt")
         self.register(KeyCode.BACKSPACE.value, "delete_char", "Delete previous character")
+        self.register(KeyCode.CTRL_H.value, "delete_char", "Delete previous character (Windows)")
         self.register(KeyCode.CTRL_C.value, "cancel", "Cancel current operation")
 
         # Command palette

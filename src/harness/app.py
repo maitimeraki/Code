@@ -24,10 +24,8 @@ class HarnessApp:
 
     async def run(self) -> None:
         """Main application loop (Phase 2: UI + Orchestration)."""
-        # Initialize UI and orchestrator
-        self.ui.initialize()
-
         # Run UI event loops (input, display, streams) concurrently
+        # (initialize is called internally by ui.run())
         await self.ui.run()
 
     async def _create_and_run_task(self, task_description: str) -> None:

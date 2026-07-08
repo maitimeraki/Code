@@ -29,7 +29,7 @@ class TerminalUI:
         self.input_bar = InputBar(self.console)
         self.state = UIState()
         self.running = True
-        self._dirty = True
+        self._dirty = False
 
         # Phase 2B: Keyboard input
         self.keybinds = KeybindMap()
@@ -166,6 +166,7 @@ class TerminalUI:
         self.main_panel.add_line("Type a prompt and press Enter to start")
         self.main_panel.add_line("")
         self.main_panel.add_info("Phase 2C: Real-Time Stream Integration Active")
+        self._dirty = True  # Initial render
 
     def render_layout(self) -> Layout:
         """Create layout with status bar, main panel, and input bar."""
@@ -206,11 +207,9 @@ class TerminalUI:
                         self.input_bar.state.palette_buffer += key
                     else:
                         self.input_bar.add_char(key)
-                    self._dirty = True
                 else:
                     # Handle control keys
                     await self.input_handler.handle_key(key)
-                    self._dirty = True
 
                 await asyncio.sleep(0.001)
             except KeyboardInterrupt:
