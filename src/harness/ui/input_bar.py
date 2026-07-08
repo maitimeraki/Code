@@ -2,9 +2,9 @@
 
 from dataclasses import dataclass, field
 from typing import List, Optional, Callable, Awaitable
-from rich.console import Console
+from rich.console import Console, Group
 from rich.text import Text
-from rich.panel import Panel
+from rich.rule import Rule
 from .claude_code_style import Styles
 
 
@@ -96,8 +96,8 @@ class InputBar:
         self.state.palette_buffer = ""
         self.state.hint = "< for agents"
 
-    def render(self) -> Panel:
-        """Render input bar with visible box border."""
+    def render(self) -> Group:
+        """Render input bar: full-width rule / prompt / rule / hint (Claude Code style)."""
         prompt_text = Text()
 
         if self.state.in_palette_mode:
@@ -111,21 +111,12 @@ class InputBar:
 
         hint_text = Text(self.state.hint, style=Styles.HINT)
 
-        content = Text()
-        content.append_text(prompt_text)
-        content.append("\n")
-        content.append_text(hint_text)
-
-        return Panel(
-            content,
-            border_style="blue",
-            expand=False,
-            padding=(0, 1),
+        return Group(
+            Rule(style=Styles.BORDER),
+            prompt_text,
+            Rule(style=Styles.BORDER),
+            hint_text,
         )
-
-    def render_hint(self) -> Text:
-        """Render hint text (now included in render panel)."""
-        return Text("")
 
     def get_current_input(self) -> str:
         """Get current input (either buffer or palette buffer)."""

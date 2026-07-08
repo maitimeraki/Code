@@ -5,6 +5,7 @@ import signal
 from typing import Optional
 from rich.console import Console
 from rich.layout import Layout
+from rich.live import Live
 from .claude_code_style import create_console
 from .statusbar import StatusBar, StatusInfo
 from .main_panel import MainPanel
@@ -102,25 +103,29 @@ class TerminalUI:
             prev = self.input_bar.get_previous()
             if prev is not None:
                 self.input_bar.set_buffer(prev)
+                self._dirty = True
 
         async def on_history_next(event: KeyEvent):
             """Handle Down arrow - next history."""
             next_input = self.input_bar.get_next()
             if next_input is not None:
                 self.input_bar.set_buffer(next_input)
+                self._dirty = True
 
         async def on_open_palette(event: KeyEvent):
             """Handle Ctrl+K - open command palette."""
             self.input_bar.enter_palette_mode()
+            self._dirty = True
 
         async def on_clear_screen(event: KeyEvent):
             """Handle Ctrl+L - clear main panel."""
             self.main_panel.clear()
+            self._dirty = True
 
         async def on_cancel(event: KeyEvent):
             """Handle Ctrl+C - cancel operation."""
             self.state.pause()
-            self.main_panel.add_error("Operation cancelled")
+            self.add_message("Operation cancelled", level="error")
 
         async def on_quit(event: KeyEvent):
             """Handle Ctrl+D - quit."""
@@ -169,7 +174,7 @@ class TerminalUI:
         layout.split_column(
             Layout(name="status", size=1),
             Layout(name="main"),
-            Layout(name="input", size=5),
+            Layout(name="input", size=4),
         )
 
         status_text = self.status_bar.render()
@@ -179,8 +184,8 @@ class TerminalUI:
         main_panel_widget = self.main_panel.render(height)
         layout["main"].update(main_panel_widget)
 
-        input_panel = self.input_bar.render()
-        layout["input"].update(input_panel)
+        input_widget = self.input_bar.render()
+        layout["input"].update(input_widget)
 
         return layout
 
@@ -193,12 +198,13 @@ class TerminalUI:
                     await asyncio.sleep(0.01)
                     continue
 
-                # Handle text input (don't mark dirty - refresh cycle shows it)
+                # Handle text input
                 if self.input_handler.is_text_input(key):
                     if self.input_bar.state.in_palette_mode:
                         self.input_bar.state.palette_buffer += key
                     else:
                         self.input_bar.add_char(key)
+                    self._dirty = True
                 else:
                     # Handle control keys
                     await self.input_handler.handle_key(key)
@@ -216,8 +222,7 @@ class TerminalUI:
             try:
                 if self._dirty:
                     layout = self.render_layout()
-                    self.console.clear()
-                    self.console.print(layout)
+                    self._live.update(layout, refresh=True)
                     self._dirty = False
                 await asyncio.sleep(0.05)
             except KeyboardInterrupt:
@@ -229,19 +234,24 @@ class TerminalUI:
     async def run(self) -> None:
         """Run the terminal UI."""
         self.initialize()
+        initial_layout = self.render_layout()
 
-        # Run input, display, and stream loops concurrently
-        try:
-            await asyncio.gather(
-                self.input_loop(),
-                self.display_loop(),
-                self.stream_aggregator.start(),
-                return_exceptions=True
-            )
-        except KeyboardInterrupt:
-            self.state.shutdown()
-        finally:
-            self.shutdown()
+        # Run with Live for flicker-free rendering
+        with Live(initial_layout, console=self.console, auto_refresh=False, screen=False) as live:
+            self._live = live
+
+            # Run input, display, and stream loops concurrently
+            try:
+                await asyncio.gather(
+                    self.input_loop(),
+                    self.display_loop(),
+                    self.stream_aggregator.start(),
+                    return_exceptions=True
+                )
+            except KeyboardInterrupt:
+                self.state.shutdown()
+
+        self.shutdown()
 
     def display_once(self) -> None:
         """Render UI once (for testing)."""
@@ -255,7 +265,6 @@ class TerminalUI:
             self.console.print()
 
             self.console.print(self.input_bar.render())
-            self.console.print(self.input_bar.render_hint())
         except Exception as e:
             self.console.print(f"[red]Display error: {str(e)}[/red]")
 
