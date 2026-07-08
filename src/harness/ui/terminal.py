@@ -85,11 +85,12 @@ class TerminalUI:
                         await cmd.handler()
                 self.input_bar.exit_palette_mode()
             else:
-                # Regular prompt
+                # Regular prompt - send to backend
                 if text:
                     self.input_bar.add_to_history(text)
-                    self.main_panel.add_info(f"Prompt: {text}")
+                    self.main_panel.add_info(f"You: {text}")
                     self.input_bar.clear()
+                    self._dirty = True  # Mark for display update
 
         async def on_delete_char(event: KeyEvent):
             """Handle Backspace - delete character."""
@@ -160,13 +161,6 @@ class TerminalUI:
             version="0.1.0",
         ))
 
-        self.main_panel.add_section("Welcome back!", "")
-        self.main_panel.add_info("Tips for getting started")
-        self.main_panel.add_line("Press Ctrl+K to open command palette")
-        self.main_panel.add_line("Use arrow keys for input history")
-        self.main_panel.add_line("Type a prompt and press Enter to start")
-        self.main_panel.add_line("")
-        self.main_panel.add_info("Phase 2C: Real-Time Stream Integration Active")
         self._dirty = True  # Initial render
 
     def render_layout(self) -> Layout:
@@ -199,13 +193,12 @@ class TerminalUI:
                     await asyncio.sleep(0.01)
                     continue
 
-                # Handle text input
+                # Handle text input (don't mark dirty - refresh cycle shows it)
                 if self.input_handler.is_text_input(key):
                     if self.input_bar.state.in_palette_mode:
                         self.input_bar.state.palette_buffer += key
                     else:
                         self.input_bar.add_char(key)
-                    self._dirty = True  # Always update display for input changes
                 else:
                     # Handle control keys
                     await self.input_handler.handle_key(key)
