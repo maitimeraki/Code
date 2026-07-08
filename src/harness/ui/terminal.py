@@ -94,6 +94,7 @@ class TerminalUI:
         async def on_delete_char(event: KeyEvent):
             """Handle Backspace - delete character."""
             self.input_bar.delete_char()
+            self._dirty = True
 
         async def on_history_prev(event: KeyEvent):
             """Handle Up arrow - previous history."""
@@ -174,21 +175,18 @@ class TerminalUI:
         layout.split_column(
             Layout(name="status", size=1),
             Layout(name="main"),
-            Layout(name="input", size=3),
+            Layout(name="input", size=5),
         )
 
         status_text = self.status_bar.render()
         layout["status"].update(self.console.render_str(str(status_text)))
 
-        height = self.console.height - 4 if self.console.height else 20
+        height = self.console.height - 6 if self.console.height else 20
         main_panel_widget = self.main_panel.render(height)
         layout["main"].update(main_panel_widget)
 
-        input_text = self.input_bar.render()
-        hint_text = self.input_bar.render_hint()
-        layout["input"].update(self.console.render_str(
-            f"{input_text}\n{hint_text}"
-        ))
+        input_panel = self.input_bar.render()
+        layout["input"].update(input_panel)
 
         return layout
 
@@ -207,6 +205,7 @@ class TerminalUI:
                         self.input_bar.state.palette_buffer += key
                     else:
                         self.input_bar.add_char(key)
+                    self._dirty = True  # Always update display for input changes
                 else:
                     # Handle control keys
                     await self.input_handler.handle_key(key)

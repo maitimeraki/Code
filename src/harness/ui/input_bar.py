@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Callable, Awaitable
 from rich.console import Console
 from rich.text import Text
+from rich.panel import Panel
 from .claude_code_style import Styles
 
 
@@ -28,6 +29,7 @@ class InputBar:
         self.console = console
         self.state = InputBarState()
         self.on_submit: Optional[Callable[[str], Awaitable[None]]] = None
+        self.on_buffer_change: Optional[Callable[[], Awaitable[None]]] = None
 
     def clear(self) -> None:
         """Clear input buffer."""
@@ -94,8 +96,8 @@ class InputBar:
         self.state.palette_buffer = ""
         self.state.hint = "< for agents"
 
-    def render(self) -> Text:
-        """Render input bar."""
+    def render(self) -> Panel:
+        """Render input bar with visible box border."""
         prompt_text = Text()
 
         if self.state.in_palette_mode:
@@ -106,11 +108,24 @@ class InputBar:
             prompt_text.append(self.state.buffer, style=Styles.INPUT_TEXT)
 
         prompt_text.append("|", style=Styles.PROMPT)
-        return prompt_text
+
+        hint_text = Text(self.state.hint, style=Styles.HINT)
+
+        content = Text()
+        content.append_text(prompt_text)
+        content.append("\n")
+        content.append_text(hint_text)
+
+        return Panel(
+            content,
+            border_style="blue",
+            expand=False,
+            padding=(0, 1),
+        )
 
     def render_hint(self) -> Text:
-        """Render hint text."""
-        return Text(self.state.hint, style=Styles.HINT)
+        """Render hint text (now included in render panel)."""
+        return Text("")
 
     def get_current_input(self) -> str:
         """Get current input (either buffer or palette buffer)."""
