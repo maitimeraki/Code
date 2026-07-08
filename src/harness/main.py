@@ -196,23 +196,5 @@ LOG_LEVEL=info
     console.print("✓ Harness initialized")
 
 
-def main() -> None:
-    """Main entry point."""
-    import sys
-    known_commands = {"run", "resume", "status", "knowledge-search", "init", "--help", "-h", "--version"}
-
-    # If no command args, launch interactive UI
-    has_command = any(arg in known_commands for arg in sys.argv[1:])
-    if not has_command:
-        settings = get_settings()
-        configure_logging(settings.log_level)
-        app_instance = HarnessApp()
-        asyncio.run(app_instance.run())
-        return
-
-    # Otherwise use Typer CLI
-    app()
-
-
 if __name__ == "__main__":
     main()

@@ -26,7 +26,6 @@ class HarnessApp:
         """Main application loop (Phase 2: UI + Orchestration)."""
         # Initialize UI and orchestrator
         self.ui.initialize()
-        self.ui.add_message("Phase 2: Terminal UI + Agent Orchestration Ready", "info")
 
         # Run UI event loops (input, display, streams) concurrently
         await self.ui.run()

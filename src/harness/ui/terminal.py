@@ -29,6 +29,7 @@ class TerminalUI:
         self.input_bar = InputBar(self.console)
         self.state = UIState()
         self.running = True
+        self._dirty = True
 
         # Phase 2B: Keyboard input
         self.keybinds = KeybindMap()
@@ -141,6 +142,7 @@ class TerminalUI:
             for entry in entries:
                 rendered = OutputRenderer.render_log_entry(entry)
                 self.main_panel.add_text(rendered)
+            self._dirty = True
 
         self.stream_aggregator.register_batch_handler(on_batch)
 
@@ -204,9 +206,11 @@ class TerminalUI:
                         self.input_bar.state.palette_buffer += key
                     else:
                         self.input_bar.add_char(key)
+                    self._dirty = True
                 else:
                     # Handle control keys
                     await self.input_handler.handle_key(key)
+                    self._dirty = True
 
                 await asyncio.sleep(0.001)
             except KeyboardInterrupt:
@@ -219,10 +223,12 @@ class TerminalUI:
         """Main UI display loop."""
         while self.running and self.state.is_running:
             try:
-                layout = self.render_layout()
-                self.console.clear()
-                self.console.print(layout)
-                await asyncio.sleep(0.05)  # 20 FPS
+                if self._dirty:
+                    layout = self.render_layout()
+                    self.console.clear()
+                    self.console.print(layout)
+                    self._dirty = False
+                await asyncio.sleep(0.05)
             except KeyboardInterrupt:
                 self.state.shutdown()
                 break
@@ -272,6 +278,7 @@ class TerminalUI:
             self.main_panel.add_info(text)
         else:
             self.main_panel.add_line(text)
+        self._dirty = True
 
     def shutdown(self) -> None:
         """Clean shutdown."""

@@ -49,10 +49,14 @@ class InputBar:
 
     def delete_char(self) -> None:
         """Delete character before cursor."""
-        if self.state.cursor_pos > 0:
-            pos = self.state.cursor_pos
-            self.state.buffer = self.state.buffer[:pos - 1] + self.state.buffer[pos:]
-            self.state.cursor_pos = max(0, pos - 1)
+        if self.state.in_palette_mode:
+            if self.state.palette_buffer:
+                self.state.palette_buffer = self.state.palette_buffer[:-1]
+        else:
+            if self.state.cursor_pos > 0:
+                pos = self.state.cursor_pos
+                self.state.buffer = self.state.buffer[:pos - 1] + self.state.buffer[pos:]
+                self.state.cursor_pos = max(0, pos - 1)
 
     def set_buffer(self, text: str) -> None:
         """Set input buffer and cursor to end."""
