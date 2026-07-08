@@ -239,6 +239,8 @@ class TerminalUI:
         # Run with Live for flicker-free rendering
         with Live(initial_layout, console=self.console, auto_refresh=False, screen=False) as live:
             self._live = live
+            # Force initial render display
+            live.update(initial_layout, refresh=True)
 
             # Run input, display, and stream loops concurrently
             try:
