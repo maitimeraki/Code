@@ -96,31 +96,26 @@ class TerminalUI:
         async def on_delete_char(event: KeyEvent):
             """Handle Backspace - delete character."""
             self.input_bar.delete_char()
-            self._dirty = True
 
         async def on_history_prev(event: KeyEvent):
             """Handle Up arrow - previous history."""
             prev = self.input_bar.get_previous()
             if prev is not None:
                 self.input_bar.set_buffer(prev)
-                self._dirty = True
 
         async def on_history_next(event: KeyEvent):
             """Handle Down arrow - next history."""
             next_input = self.input_bar.get_next()
             if next_input is not None:
                 self.input_bar.set_buffer(next_input)
-                self._dirty = True
 
         async def on_open_palette(event: KeyEvent):
             """Handle Ctrl+K - open command palette."""
             self.input_bar.enter_palette_mode()
-            self._dirty = True
 
         async def on_clear_screen(event: KeyEvent):
             """Handle Ctrl+L - clear main panel."""
             self.main_panel.clear()
-            self._dirty = True
 
         async def on_cancel(event: KeyEvent):
             """Handle Ctrl+C - cancel operation."""
@@ -166,7 +161,7 @@ class TerminalUI:
             version="0.1.0",
         ))
 
-        self._dirty = True  # Initial render
+        self._dirty = False  # Start clean - CompatibleLive prints initial layout
 
     def render_layout(self) -> Layout:
         """Create layout with status bar, main panel, and input bar."""
@@ -198,13 +193,12 @@ class TerminalUI:
                     await asyncio.sleep(0.01)
                     continue
 
-                # Handle text input
+                # Handle text input (NO display update on keystroke)
                 if self.input_handler.is_text_input(key):
                     if self.input_bar.state.in_palette_mode:
                         self.input_bar.state.palette_buffer += key
                     else:
                         self.input_bar.add_char(key)
-                    self._dirty = True
                 else:
                     # Handle control keys
                     await self.input_handler.handle_key(key)
@@ -217,39 +211,47 @@ class TerminalUI:
                 await asyncio.sleep(0.01)
 
     async def display_loop(self) -> None:
-        """Main UI display loop."""
+        """Update display only on actual changes (message added or input cleared)."""
+        last_message_count = 0
         while self.running and self.state.is_running:
             try:
-                if self._dirty:
+                # Update only if: _dirty flag set OR new messages added
+                current_message_count = len(self.main_panel.state.lines)
+
+                if self._dirty or current_message_count != last_message_count:
                     layout = self.render_layout()
                     self._live.update(layout)
                     self._dirty = False
-                await asyncio.sleep(0.05)
+                    last_message_count = current_message_count
+
+                await asyncio.sleep(0.1)  # Check 10x per second, not per keystroke
             except KeyboardInterrupt:
                 self.state.shutdown()
                 break
             except Exception:
-                await asyncio.sleep(0.05)
+                await asyncio.sleep(0.1)
 
     async def run(self) -> None:
         """Run the terminal UI."""
         self.initialize()
         initial_layout = self.render_layout()
 
-        # Run with Live for flicker-free rendering
-        with Live(initial_layout, console=self.console, auto_refresh=True, refresh_per_second=20, screen=False) as live:
-            self._live = live
+        # Use Rich's Live display for proper terminal rendering
+        self._live = Live(initial_layout, console=self.console, refresh_per_second=10)
+        self._live.start()
 
-            # Run input, display, and stream loops concurrently
-            try:
-                await asyncio.gather(
-                    self.input_loop(),
-                    self.display_loop(),
-                    self.stream_aggregator.start(),
-                    return_exceptions=True
-                )
-            except KeyboardInterrupt:
-                self.state.shutdown()
+        # Run input, display, and stream loops concurrently
+        try:
+            await asyncio.gather(
+                self.input_loop(),
+                self.display_loop(),
+                self.stream_aggregator.start(),
+                return_exceptions=True
+            )
+        except KeyboardInterrupt:
+            self.state.shutdown()
+        finally:
+            self._live.stop()
 
         self.shutdown()
 

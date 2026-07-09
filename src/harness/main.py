@@ -3,7 +3,7 @@
 import asyncio
 from pathlib import Path
 from typing import Optional
-
+# Typer is a library that turns Python functions into CLI commands
 import typer
 from rich.console import Console
 
@@ -20,21 +20,79 @@ logger = get_logger(__name__)
 
 
 def main() -> None:
-    """Main entry point."""
+    """Main entry point - always launch UI with optional auto-execution."""
     import sys
-    known_commands = {"run", "resume", "status", "knowledge-search", "init", "--help", "-h", "--version"}
+    settings = get_settings()
+    configure_logging(settings.log_level)
 
-    # If no command args, launch interactive UI
-    has_command = any(arg in known_commands for arg in sys.argv[1:])
-    if not has_command:
-        settings = get_settings()
-        configure_logging(settings.log_level)
-        app_instance = HarnessApp()
+    # Parse CLI args to extract command info (if any)
+    command_info = _parse_command_args(sys.argv[1:])
+
+    # Always launch the app (with optional command to auto-execute)
+    app_instance = HarnessApp(auto_command=command_info)
+
+    try:
         asyncio.run(app_instance.run())
-        return
+    except KeyboardInterrupt:
+        pass
+    except Exception as e:
+        logger.error("Fatal error in main", error=str(e))
+        raise
 
-    # Otherwise use Typer CLI
-    app()
+
+def _parse_command_args(args: list[str]) -> Optional[dict]:
+    """Parse command-line arguments and return command info dict or None."""
+    if not args:
+        return None
+
+    # Handle help/version flags (exit early)
+    if args[0] in {"--help", "-h", "--version"}:
+        app()
+        return None
+
+    command = args[0]
+
+    if command == "run":
+        task_desc = None
+        max_iter = 10
+        for i, arg in enumerate(args[1:], 1):
+            if arg in {"--task", "-t"} and i < len(args) - 1:
+                task_desc = args[i + 1]
+            elif arg == "--max-iterations" and i < len(args) - 1:
+                try:
+                    max_iter = int(args[i + 1])
+                except ValueError:
+                    pass
+        if task_desc:
+            return {"command": "run", "task": task_desc, "max_iterations": max_iter}
+
+    elif command == "resume":
+        task_id = None
+        for i, arg in enumerate(args[1:], 1):
+            if arg in {"--task-id", "-id"} and i < len(args) - 1:
+                task_id = args[i + 1]
+        if task_id:
+            return {"command": "resume", "task_id": task_id}
+
+    elif command == "status":
+        return {"command": "status"}
+
+    elif command == "init":
+        return {"command": "init"}
+
+    elif command == "knowledge-search":
+        query = args[1] if len(args) > 1 else None
+        limit = 5
+        for i, arg in enumerate(args[1:], 1):
+            if arg == "--limit" and i < len(args) - 1:
+                try:
+                    limit = int(args[i + 1])
+                except ValueError:
+                    pass
+        if query:
+            return {"command": "knowledge-search", "query": query, "limit": limit}
+
+    return None
 
 
 @app.command()
@@ -47,8 +105,8 @@ def run(
     configure_logging(settings.log_level)
 
     async def async_run():
-        manager = TaskStateManager(settings.data_dir)
-        controller = LoopController(settings.data_dir)
+        manager = TaskStateManager(settings.get_data_dir())
+        controller = LoopController(settings.get_data_dir())
 
         console.print(f"[bold green]Starting task:[/bold green] {task_description}")
 
@@ -88,8 +146,8 @@ def resume(
     configure_logging(settings.log_level)
 
     async def async_resume():
-        manager = TaskStateManager(settings.data_dir)
-        controller = LoopController(settings.data_dir)
+        manager = TaskStateManager(settings.get_data_dir())
+        controller = LoopController(settings.get_data_dir())
 
         state = await manager.load_state(task_id)
         if not state:
@@ -121,7 +179,7 @@ def status() -> None:
     configure_logging(settings.log_level)
 
     async def async_status():
-        manager = TaskStateManager(settings.data_dir)
+        manager = TaskStateManager(settings.get_data_dir())
         task_ids = await manager.list_tasks()
 
         console.print("[bold]Active Tasks:[/bold]")
@@ -162,9 +220,10 @@ def init() -> None:
 
     console.print("[bold green]Initializing harness project...[/bold green]")
 
-    # Create data and templates directories
-    settings.data_dir.mkdir(exist_ok=True)
-    settings.templates_dir.mkdir(exist_ok=True)
+    # User-level dirs are auto-created on first access via get_*_dir()
+    # Project-level dirs must be created manually by users to override user-level paths
+    settings.get_data_dir()
+    settings.get_templates_dir()
 
     # Create .env if not exists
     env_file = Path(".env")

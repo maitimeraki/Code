@@ -57,7 +57,7 @@ def create_console() -> Console:
 
     return Console(
         force_terminal=True,
-        force_interactive=False,
+        force_interactive=True,
         legacy_windows=False,
         color_system="truecolor",
         width=None,
