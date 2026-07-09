@@ -4,7 +4,15 @@ import sys
 import asyncio
 from typing import Optional, Callable, Dict, Awaitable
 from dataclasses import dataclass
-from .keybinds import KeybindMap
+from .keybinds import KeybindMap, KeyCode
+
+
+_WINDOWS_EXTENDED_KEY_MAP: Dict[str, str] = {
+    "H": KeyCode.UP.value,
+    "P": KeyCode.DOWN.value,
+    "K": KeyCode.LEFT.value,
+    "M": KeyCode.RIGHT.value,
+}
 
 
 @dataclass
@@ -21,6 +29,8 @@ class InputHandler:
     def __init__(self, keybinds: KeybindMap):
         self.keybinds = keybinds
         self.handlers: Dict[str, Callable[[KeyEvent], Awaitable[None]]] = {}
+        # Try to use msvcrt on Windows (works on interactive console)
+        self._use_msvcrt = sys.platform == "win32"
 
     def register_handler(
         self, action: str, handler: Callable[[KeyEvent], Awaitable[None]]
@@ -53,24 +63,42 @@ class InputHandler:
             return await self._read_key_unix()
 
     async def _read_key_windows(self) -> Optional[str]:
-        """Read key on Windows using msvcrt."""
+        """Read key on Windows using msvcrt (no echo, no orphaned threads)."""
+        if self._use_msvcrt:
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(None, self._read_key_windows_msvcrt)
+        return await self._read_key_windows_piped()
+
+    def _read_key_windows_msvcrt(self) -> Optional[str]:
+        """Non-blocking, no-echo key read via msvcrt (real TTY only)."""
         try:
             import msvcrt
-
-            if msvcrt.kbhit():
-                key = msvcrt.getch()
-                # Handle arrow keys
-                if key == b"\xe0":
-                    next_key = msvcrt.getch()
-                    arrow_map = {
-                        b"H": "\x1b[A",  # up
-                        b"P": "\x1b[B",  # down
-                        b"K": "\x1b[D",  # left
-                        b"M": "\x1b[C",  # right
-                    }
-                    return arrow_map.get(next_key)
-                return key.decode("utf-8", errors="ignore")
+        except ImportError:
             return None
+
+        if not msvcrt.kbhit():
+            return None
+
+        ch = msvcrt.getch()
+
+        if ch in (b"\x00", b"\xe0"):
+            scan = msvcrt.getch()
+            return _WINDOWS_EXTENDED_KEY_MAP.get(chr(scan[0]))
+
+        return ch.decode('utf-8', errors='replace') if isinstance(ch, bytes) else ch
+
+    async def _read_key_windows_piped(self) -> Optional[str]:
+        """Executor-based read; used only when stdin is not a TTY."""
+        try:
+            loop = asyncio.get_event_loop()
+            try:
+                ch = await asyncio.wait_for(
+                    loop.run_in_executor(None, sys.stdin.read, 1),
+                    timeout=0.01
+                )
+                return ch if ch else None
+            except asyncio.TimeoutError:
+                return None
         except Exception:
             return None
 
