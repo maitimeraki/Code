@@ -9,6 +9,7 @@ import structlog
 from harness.core.models import TaskState, TaskStatus, ExitCondition
 from harness.core.task_manager import TaskStateManager
 from harness.core.completion import CompletionChecker
+from harness.config import get_settings
 
 
 logger = structlog.get_logger(__name__)
@@ -17,7 +18,9 @@ logger = structlog.get_logger(__name__)
 class LoopController:
     """Orchestrate task execution loop with checkpointing."""
 
-    def __init__(self, data_dir: Path = Path("data")):
+    def __init__(self, data_dir: Optional[Path] = None):
+        if data_dir is None:
+            data_dir = get_settings().get_data_dir()
         self.task_manager = TaskStateManager(data_dir)
         self.loop_handlers: dict[str, Callable] = {}
 

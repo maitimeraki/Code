@@ -85,33 +85,38 @@ class TerminalUI:
                     if cmd.handler:
                         await cmd.handler()
                 self.input_bar.exit_palette_mode()
+                self._dirty = True
             else:
                 # Regular prompt - send to backend
                 if text:
                     self.input_bar.add_to_history(text)
                     self.main_panel.add_info(f"You: {text}")
                     self.input_bar.clear()
-                    self._dirty = True  # Mark for display update
+                    self._dirty = True
 
         async def on_delete_char(event: KeyEvent):
             """Handle Backspace - delete character."""
             self.input_bar.delete_char()
+            self._dirty = True
 
         async def on_history_prev(event: KeyEvent):
             """Handle Up arrow - previous history."""
             prev = self.input_bar.get_previous()
             if prev is not None:
                 self.input_bar.set_buffer(prev)
+                self._dirty = True
 
         async def on_history_next(event: KeyEvent):
             """Handle Down arrow - next history."""
             next_input = self.input_bar.get_next()
             if next_input is not None:
                 self.input_bar.set_buffer(next_input)
+                self._dirty = True
 
         async def on_open_palette(event: KeyEvent):
             """Handle Ctrl+K - open command palette."""
             self.input_bar.enter_palette_mode()
+            self._dirty = True
 
         async def on_clear_screen(event: KeyEvent):
             """Handle Ctrl+L - clear main panel."""
@@ -193,12 +198,13 @@ class TerminalUI:
                     await asyncio.sleep(0.01)
                     continue
 
-                # Handle text input (NO display update on keystroke)
+                # Handle text input
                 if self.input_handler.is_text_input(key):
                     if self.input_bar.state.in_palette_mode:
                         self.input_bar.state.palette_buffer += key
                     else:
                         self.input_bar.add_char(key)
+                    self._dirty = True
                 else:
                     # Handle control keys
                     await self.input_handler.handle_key(key)
@@ -220,7 +226,7 @@ class TerminalUI:
 
                 if self._dirty or current_message_count != last_message_count:
                     layout = self.render_layout()
-                    self._live.update(layout)
+                    self._live.update(layout, refresh=True)
                     self._dirty = False
                     last_message_count = current_message_count
 
@@ -236,9 +242,9 @@ class TerminalUI:
         self.initialize()
         initial_layout = self.render_layout()
 
-        # Use Rich's Live display for proper terminal rendering
-        self._live = Live(initial_layout, console=self.console, refresh_per_second=10)
-        self._live.start()
+        # Use Rich's Live display for proper terminal rendering (no auto_refresh — we drive updates from display_loop)
+        self._live = Live(initial_layout, console=self.console, refresh_per_second=10, auto_refresh=False)
+        self._live.start(refresh=True)
 
         # Run input, display, and stream loops concurrently
         try:

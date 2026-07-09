@@ -60,10 +60,6 @@ class KeybindMap:
         self.register(KeyCode.UP.value, "history_prev", "Previous input (arrow up)")
         self.register(KeyCode.DOWN.value, "history_next", "Next input (arrow down)")
 
-        # Scrolling
-        self.register("j", "scroll_down", "Scroll down (j)")
-        self.register("k", "scroll_up", "Scroll up (k)")
-
         # Quit
         self.register(KeyCode.CTRL_D.value, "quit", "Quit application")
 
@@ -84,6 +80,10 @@ class KeybindMap:
 
     def get_action(self, key: str) -> Optional[str]:
         """Get action for a key."""
+        # Handle Enter key - could be \r or \n depending on platform/input method
+        if key in ("\r", "\n"):
+            key = "\r"  # Normalize to \r
+
         binding = self.bindings.get(key)
         return binding.action if binding else None
 
