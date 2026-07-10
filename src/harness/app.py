@@ -1,13 +1,13 @@
 """Interactive Terminal UI application (Claude Code style)."""
 
 import asyncio
-from pathlib import Path
 from typing import Optional
 
-from harness.config import get_settings
+from harness.config import get_settings, export_env_from_settings, get_app_settings
 from harness.logging import configure_logging, get_logger
 from harness.ui.terminal import TerminalUI
 from harness.orchestration import HarnessOrchestrator
+from harness.orchestration.llm_client import LLMClient
 from harness.core.task_manager import TaskStateManager
 from harness.core.loop import LoopController
 from harness.core.completion import CompletionChecker
@@ -23,7 +23,9 @@ class HarnessApp:
         self.settings = get_settings()
         configure_logging(self.settings.log_level)
 
-        self.ui = TerminalUI()
+        export_env_from_settings()
+        llm_client = LLMClient()
+        self.ui = TerminalUI(llm_client=llm_client)
         self.orchestrator = HarnessOrchestrator(ui=self.ui)
         self.auto_command = auto_command
 

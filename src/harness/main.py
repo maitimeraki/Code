@@ -225,32 +225,20 @@ def init() -> None:
     settings.get_data_dir()
     settings.get_templates_dir()
 
-    # Create .env if not exists
-    env_file = Path(".env")
-    if not env_file.exists():
-        env_file.write_text(
-            """# LLM Providers
-CLAUDE_API_KEY=sk-ant-...
-OPENAI_API_KEY=sk-...
-AZURE_API_KEY=...
-
-# Database (dev uses SQLite, prod uses PostgreSQL)
-DATABASE_URL=sqlite+aiosqlite:///harness.db
-
-# Cache (optional)
-REDIS_URL=redis://localhost:6379
-
-# Execution
-EXECUTION_MODE=local
-MAX_PARALLEL_AGENTS=16
-MAX_AGENT_RETRIES=3
-TOOL_TIMEOUT_SECONDS=30
-
-# Logging
-LOG_LEVEL=info
-"""
-        )
-        console.print("✓ Created .env file")
+    # Create settings.json if not exists
+    import json
+    settings_file = settings.get_settings_file_path()
+    if not settings_file.exists():
+        settings_template = {
+            "env": {
+                "ANTHROPIC_BASE_URL": "https://api.anthropic.com",
+                "ANTHROPIC_API_KEY": "env:CODE_API_KEY",
+            },
+            "model": "claude-3-5-sonnet-20241022",
+            "subagent_model": "claude-3-5-haiku-20241022"
+        }
+        settings_file.write_text(json.dumps(settings_template, indent=2))
+        console.print("✓ Created settings.json")
 
     console.print("✓ Harness initialized")
 
