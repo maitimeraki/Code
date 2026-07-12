@@ -2,14 +2,16 @@
 
 import asyncio
 import signal
-from typing import Optional
-from rich.console import Console
+from typing import Optional, TYPE_CHECKING
 from rich.layout import Layout
 from rich.live import Live
+from rich.text import Text
 from .claude_code_style import create_console
 from .statusbar import StatusBar, StatusInfo
 from .main_panel import MainPanel
 from .input_bar import InputBar
+from .header import Header
+from .welcome_panel import WelcomePanel
 from .state import UIState
 from .keybinds import KeybindMap
 from .input_handler import InputHandler, KeyEvent
@@ -19,18 +21,28 @@ from .stream_listener import StreamListener, LogEntry
 from .stream_aggregator import StreamAggregator
 from .renderers import OutputRenderer
 
+if TYPE_CHECKING:
+    from harness.orchestration.llm_client import LLMClient
+
 
 class TerminalUI:
     """Claude Code-style terminal UI orchestrator."""
 
-    def __init__(self):
+    def __init__(self, llm_client: Optional["LLMClient"] = None):
         self.console = create_console()
+        self.header = Header(self.console)
+        self.welcome_panel = WelcomePanel(self.console)
         self.status_bar = StatusBar(self.console)
         self.main_panel = MainPanel(self.console)
         self.input_bar = InputBar(self.console)
         self.state = UIState()
         self.running = True
         self._dirty = False
+        self.show_welcome = True  # Show welcome panel on first run
+
+        # LLM client for chat input
+        self.llm_client = llm_client
+        self.current_model = llm_client.settings.model if llm_client else None
 
         # Phase 2B: Keyboard input
         self.keybinds = KeybindMap()
@@ -87,12 +99,21 @@ class TerminalUI:
                 self.input_bar.exit_palette_mode()
                 self._dirty = True
             else:
-                # Regular prompt - send to backend
+                # Regular prompt - check for /model command or send to LLM
                 if text:
                     self.input_bar.add_to_history(text)
-                    self.main_panel.add_info(f"You: {text}")
                     self.input_bar.clear()
+                    self.main_panel.state.scroll_position = 0
                     self._dirty = True
+
+                    if text.startswith("/model"):
+                        self._handle_model_command(text)
+                    elif self.llm_client:
+                        self.main_panel.add_info(f"You: {text}")
+                        task = asyncio.create_task(self._handle_llm_prompt(text))
+                    else:
+                        self.main_panel.add_info(f"You: {text}")
+                        self.main_panel.add_info("(LLM not configured. Run 'harness init' and set API keys.)")
 
         async def on_delete_char(event: KeyEvent):
             """Handle Backspace - delete character."""
@@ -127,6 +148,16 @@ class TerminalUI:
             self.state.pause()
             self.add_message("Operation cancelled", level="error")
 
+        async def on_scroll_up(event: KeyEvent):
+            """Handle Page Up - scroll conversation up."""
+            self.main_panel.state.scroll_up(5)
+            self._dirty = True
+
+        async def on_scroll_down(event: KeyEvent):
+            """Handle Page Down - scroll conversation down."""
+            self.main_panel.state.scroll_down(5)
+            self._dirty = True
+
         async def on_quit(event: KeyEvent):
             """Handle Ctrl+D - quit."""
             self.state.shutdown()
@@ -140,14 +171,37 @@ class TerminalUI:
         self.input_handler.register_handler("open_palette", on_open_palette)
         self.input_handler.register_handler("clear_screen", on_clear_screen)
         self.input_handler.register_handler("cancel", on_cancel)
+        self.input_handler.register_handler("scroll_up", on_scroll_up)
+        self.input_handler.register_handler("scroll_down", on_scroll_down)
         self.input_handler.register_handler("quit", on_quit)
 
     def _setup_stream_handlers(self) -> None:
-        """Setup stream batch handler to update UI."""
+        """Setup stream batch handler to update UI with specialized rendering per entry type."""
         async def on_batch(entries: list[LogEntry]):
-            """Handle a batch of log entries."""
+            """Handle a batch of log entries with type-aware rendering."""
             for entry in entries:
-                rendered = OutputRenderer.render_log_entry(entry)
+                # Route to specialized renderer based on entry source and data
+                if entry.source == "tool" and entry.data:
+                    if entry.data.get("result") is None and entry.data.get("error") is None:
+                        # Tool call (args but no result yet)
+                        rendered = OutputRenderer.render_tool_call(
+                            entry.data.get("tool", "unknown"),
+                            entry.data.get("args")
+                        )
+                    else:
+                        # Tool output (result or error arrived)
+                        rendered = OutputRenderer.render_tool_output(
+                            entry.data.get("tool", "unknown"),
+                            entry.data.get("result") or entry.data.get("error", ""),
+                            is_error=bool(entry.data.get("error"))
+                        )
+                elif entry.source == "agent":
+                    # Agent reasoning/thinking
+                    rendered = OutputRenderer.render_agent_thinking(entry.message)
+                else:
+                    # Fallback to generic log entry render for everything else
+                    rendered = OutputRenderer.render_log_entry(entry)
+
                 self.main_panel.add_text(rendered)
             self._dirty = True
 
@@ -159,6 +213,16 @@ class TerminalUI:
         self._setup_input_handlers()
         self._setup_stream_handlers()
 
+        # Fold welcome panel into scrollback as the first content (scrolls naturally)
+        # Render as plain Text (not Panel) so it wraps/scrolls with other content
+        left = self.welcome_panel.render_left_column()
+        right = self.welcome_panel.render_right_column()
+        welcome_text = Text()
+        welcome_text.append(left)
+        welcome_text.append("\n\n")
+        welcome_text.append(right)
+        self.main_panel.add_text(welcome_text)
+
         self.status_bar.update(StatusInfo(
             project_name="Agent Harness",
             branch="main",
@@ -169,23 +233,43 @@ class TerminalUI:
         self._dirty = False  # Start clean - CompatibleLive prints initial layout
 
     def render_layout(self) -> Layout:
-        """Create layout with status bar, main panel, and input bar."""
+        """Create responsive layout: header + main + input (pinned) + status (pinned)."""
         layout = Layout()
+        width = self.console.width if self.console.width else 120
+        height = self.console.height if self.console.height else 40
+
+        # Pinned heights (always visible)
+        header_height = 2
+        input_height = 4
+        status_height = 1
+
+        # Calculate remaining height for scrollable main panel (fills all available space)
+        total_fixed = header_height + input_height + status_height
+        main_height = max(10, height - total_fixed)
+
+        # Fixed 4-region layout: header / main (flex) / input (pinned) / status (pinned)
         layout.split_column(
-            Layout(name="status", size=1),
-            Layout(name="main"),
-            Layout(name="input", size=4),
+            Layout(name="header", size=header_height),
+            Layout(name="main", size=main_height),
+            Layout(name="input", size=input_height),
+            Layout(name="status", size=status_height),
         )
 
-        status_text = self.status_bar.render()
-        layout["status"].update(self.console.render_str(str(status_text)))
+        # Render header (metadata: branch, version, path)
+        header_widget = self.header.render()
+        layout["header"].update(header_widget)
 
-        height = self.console.height - 6 if self.console.height else 20
-        main_panel_widget = self.main_panel.render(height)
+        # Render main scrollable panel with row-aware windowing
+        main_panel_widget = self.main_panel.render(main_height, width)
         layout["main"].update(main_panel_widget)
 
+        # Render pinned input bar at bottom
         input_widget = self.input_bar.render()
         layout["input"].update(input_widget)
+
+        # Render pinned status bar at absolute bottom
+        status_text = self.status_bar.render()
+        layout["status"].update(self.console.render_str(str(status_text)))
 
         return layout
 
@@ -219,16 +303,19 @@ class TerminalUI:
     async def display_loop(self) -> None:
         """Update display only on actual changes (message added or input cleared)."""
         last_message_count = 0
+        last_size = self.console.size
         while self.running and self.state.is_running:
             try:
-                # Update only if: _dirty flag set OR new messages added
+                # Update if: _dirty flag set, new messages added, or terminal resized
                 current_message_count = len(self.main_panel.state.lines)
+                current_size = self.console.size
 
-                if self._dirty or current_message_count != last_message_count:
+                if self._dirty or current_message_count != last_message_count or current_size != last_size:
                     layout = self.render_layout()
                     self._live.update(layout, refresh=True)
                     self._dirty = False
                     last_message_count = current_message_count
+                    last_size = current_size
 
                 await asyncio.sleep(0.1)  # Check 10x per second, not per keystroke
             except KeyboardInterrupt:
@@ -257,6 +344,7 @@ class TerminalUI:
         except KeyboardInterrupt:
             self.state.shutdown()
         finally:
+            self.input_handler.shutdown()
             self._live.stop()
 
         self.shutdown()
@@ -265,14 +353,21 @@ class TerminalUI:
         """Render UI once (for testing)."""
         try:
             self.console.clear()
-            self.console.print(self.status_bar.render())
+            self.console.print(self.header.render())
             self.console.print()
 
-            height = self.console.height - 4 if self.console.height else 20
+            if self.show_welcome:
+                self.console.print(self.welcome_panel.render())
+                self.console.print()
+
+            height = max(10, self.console.height - 12 if self.console.height else 20)
             self.console.print(self.main_panel.render(height))
             self.console.print()
 
             self.console.print(self.input_bar.render())
+            self.console.print()
+
+            self.console.print(self.status_bar.render())
         except Exception as e:
             self.console.print(f"[red]Display error: {str(e)}[/red]")
 
@@ -287,6 +382,58 @@ class TerminalUI:
         else:
             self.main_panel.add_line(text)
         self._dirty = True
+
+    def _handle_model_command(self, text: str) -> None:
+        """Handle /model command to list or switch models."""
+        if not self.llm_client:
+            self.main_panel.add_error("LLM not configured")
+            return
+
+        parts = text.split(maxsplit=1)
+        if len(parts) == 1:
+            # /model — list available models
+            self.main_panel.add_info("Available models:")
+            for m in self.llm_client.settings.models:
+                mark = " ← current" if m == self.current_model else ""
+                self.main_panel.add_line(f"  {m}{mark}")
+            self.main_panel.add_info(f"Subagent model: {self.llm_client.settings.subagent_model}")
+        else:
+            # /model <name> — switch to model
+            model_name = parts[1]
+            if model_name in self.llm_client.settings.models:
+                self.current_model = model_name
+                self.main_panel.add_success(f"Model switched to: {model_name}")
+            else:
+                self.main_panel.add_error(f"Model '{model_name}' not found. Available: {', '.join(self.llm_client.settings.models)}")
+        self._dirty = True
+
+    async def _handle_llm_prompt(self, prompt: str) -> None:
+        """Stream LLM response for a prompt."""
+        if not self.llm_client:
+            self.main_panel.add_error("LLM client not initialized")
+            self._dirty = True
+            return
+
+        model_label = self.current_model or self.llm_client.settings.model
+        self.main_panel.add_line(f"{model_label}: ", style="bold cyan")
+        idx = len(self.main_panel.state.lines) - 1
+
+        try:
+            async for chunk in self.llm_client.stream(prompt, model=self.current_model):
+                # Mutate the last line in place to append streaming chunks
+                if idx < len(self.main_panel.state.lines):
+                    line_tuple = self.main_panel.state.lines[idx]
+                    if isinstance(line_tuple, tuple):
+                        existing_text, style = line_tuple
+                        self.main_panel.state.lines[idx] = (existing_text + chunk, style)
+                    else:
+                        # Rich Text object — append to it
+                        if hasattr(line_tuple, "append"):
+                            line_tuple.append(chunk)
+                self._dirty = True
+        except Exception as e:
+            self.main_panel.add_error(f"LLM error: {str(e)}")
+            self._dirty = True
 
     def shutdown(self) -> None:
         """Clean shutdown."""
