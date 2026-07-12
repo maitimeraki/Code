@@ -46,7 +46,7 @@ class StatusBar:
             f"{change_marker} is {status_icon} v{self.status_info.version} via {connect_icon}"
         )
 
-        return Text(status_text, style=Styles.STATUS_BAR)
+        return Text(status_text, style=Styles.STATUS_BAR, justify="right")
 
     def display(self) -> None:
         """Print status bar to console."""

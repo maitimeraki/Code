@@ -97,17 +97,17 @@ class InputBar:
         self.state.hint = "< for agents"
 
     def render(self) -> Group:
-        """Render input bar: full-width rule / prompt / rule / hint (Claude Code style)."""
-        prompt_text = Text()
+        """Render input bar with pinned cursor and responsive status indicator."""
+        prompt_text = Text(no_wrap=True, overflow="ellipsis")
 
         if self.state.in_palette_mode:
             prompt_text.append(": ", style=Styles.PROMPT)
             prompt_text.append(self.state.palette_buffer, style=Styles.INPUT_TEXT)
         else:
-            prompt_text.append("> ", style=Styles.PROMPT)
+            prompt_text.append(") ", style=Styles.PROMPT)
             prompt_text.append(self.state.buffer, style=Styles.INPUT_TEXT)
 
-        prompt_text.append("|", style=Styles.PROMPT)
+        prompt_text.append("█", style=Styles.PROMPT)
 
         hint_text = Text(self.state.hint, style=Styles.HINT)
 

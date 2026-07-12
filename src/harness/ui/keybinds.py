@@ -20,6 +20,10 @@ class KeyCode(Enum):
     DOWN = "\x1b[B"
     LEFT = "\x1b[D"
     RIGHT = "\x1b[C"
+    PAGE_UP = "\x1b[5~"
+    PAGE_DOWN = "\x1b[6~"
+    MOUSE_WHEEL_UP = "\x1b[Mu"
+    MOUSE_WHEEL_DOWN = "\x1b[Md"
 
 
 @dataclass
@@ -55,10 +59,15 @@ class KeybindMap:
 
         # Screen control
         self.register(KeyCode.CTRL_L.value, "clear_screen", "Clear main panel")
-
         # History navigation
         self.register(KeyCode.UP.value, "history_prev", "Previous input (arrow up)")
         self.register(KeyCode.DOWN.value, "history_next", "Next input (arrow down)")
+
+        # Conversation scrollback
+        self.register(KeyCode.PAGE_UP.value, "scroll_up", "Scroll conversation up (older messages)")
+        self.register(KeyCode.PAGE_DOWN.value, "scroll_down", "Scroll conversation down (newer messages)")
+        self.register(KeyCode.MOUSE_WHEEL_UP.value, "scroll_up", "Scroll conversation up (mouse wheel)")
+        self.register(KeyCode.MOUSE_WHEEL_DOWN.value, "scroll_down", "Scroll conversation down (mouse wheel)")
 
         # Quit
         self.register(KeyCode.CTRL_D.value, "quit", "Quit application")

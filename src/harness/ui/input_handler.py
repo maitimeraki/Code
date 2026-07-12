@@ -2,9 +2,12 @@
 
 import sys
 import asyncio
-from typing import Optional, Callable, Dict, Awaitable
+from typing import Optional, Callable, Dict, Awaitable, Literal
 from dataclasses import dataclass
 from .keybinds import KeybindMap, KeyCode
+
+if sys.platform == "win32":
+    from ._win_console_input import ConsoleInputReader
 
 
 _WINDOWS_EXTENDED_KEY_MAP: Dict[str, str] = {
@@ -12,6 +15,16 @@ _WINDOWS_EXTENDED_KEY_MAP: Dict[str, str] = {
     "P": KeyCode.DOWN.value,
     "K": KeyCode.LEFT.value,
     "M": KeyCode.RIGHT.value,
+}
+
+# Windows virtual key codes to synthetic key sequences (for console_api reader)
+_WINDOWS_VK_ARROW_MAP: Dict[int, str] = {
+    0x26: KeyCode.UP.value,         # VK_UP
+    0x28: KeyCode.DOWN.value,       # VK_DOWN
+    0x25: KeyCode.LEFT.value,       # VK_LEFT
+    0x27: KeyCode.RIGHT.value,      # VK_RIGHT
+    0x21: KeyCode.PAGE_UP.value,    # VK_PRIOR
+    0x22: KeyCode.PAGE_DOWN.value,  # VK_NEXT
 }
 
 
@@ -29,8 +42,29 @@ class InputHandler:
     def __init__(self, keybinds: KeybindMap):
         self.keybinds = keybinds
         self.handlers: Dict[str, Callable[[KeyEvent], Awaitable[None]]] = {}
-        # Try to use msvcrt on Windows (works on interactive console)
-        self._use_msvcrt = sys.platform == "win32"
+        self._win_tier: Literal["console_api", "msvcrt_legacy", "piped"] = "piped"
+        self._console_reader: Optional[ConsoleInputReader] = None
+
+        # Probe Windows input capabilities (3-tier fallback)
+        if sys.platform == "win32":
+            try:
+                self._console_reader = ConsoleInputReader()
+                if self._console_reader.available:
+                    self._console_reader.enable_mouse_input()
+                    self._win_tier = "console_api"
+                else:
+                    self._console_reader = None
+                    self._win_tier = "msvcrt_legacy"
+            except Exception:
+                self._win_tier = "msvcrt_legacy"
+
+    def shutdown(self) -> None:
+        """Clean shutdown - restore console mode if needed."""
+        if self._console_reader:
+            try:
+                self._console_reader.restore_mode()
+            except Exception:
+                pass
 
     def register_handler(
         self, action: str, handler: Callable[[KeyEvent], Awaitable[None]]
@@ -63,11 +97,50 @@ class InputHandler:
             return await self._read_key_unix()
 
     async def _read_key_windows(self) -> Optional[str]:
-        """Read key on Windows using msvcrt (no echo, no orphaned threads)."""
-        if self._use_msvcrt:
+        """Read key on Windows via 3-tier fallback: console_api → msvcrt_legacy → piped."""
+        if self._win_tier == "console_api":
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(None, self._read_key_windows_console)
+        elif self._win_tier == "msvcrt_legacy":
             loop = asyncio.get_event_loop()
             return await loop.run_in_executor(None, self._read_key_windows_msvcrt)
-        return await self._read_key_windows_piped()
+        else:
+            return await self._read_key_windows_piped()
+
+    def _read_key_windows_console(self) -> Optional[str]:
+        """Read key via Windows console API with mouse support."""
+        if not self._console_reader:
+            return None
+
+        try:
+            record = self._console_reader.poll_event()
+            if record is None:
+                return None
+
+            if record.EventType == 0x0001:  # KEY_EVENT
+                key_event = record.Event.KeyEvent
+                # Try virtual key code first for arrow keys
+                vk = key_event.wVirtualKeyCode
+                if vk in _WINDOWS_VK_ARROW_MAP:
+                    return _WINDOWS_VK_ARROW_MAP[vk]
+                # Fall back to Unicode character (convert from c_wchar properly)
+                char_val = str(key_event.uChar) if key_event.uChar else ""
+                if char_val and ord(char_val) >= 32:  # Printable
+                    return char_val
+                return None
+            elif record.EventType == 0x0002:  # MOUSE_EVENT
+                mouse_event = record.Event.MouseEvent
+                # Wheel delta in high 16 bits (signed)
+                wheel_delta = (mouse_event.dwButtonState >> 16) & 0xFFFF
+                if wheel_delta & 0x8000:
+                    wheel_delta = -(0x10000 - wheel_delta)
+                if wheel_delta > 0:
+                    return KeyCode.MOUSE_WHEEL_UP.value
+                elif wheel_delta < 0:
+                    return KeyCode.MOUSE_WHEEL_DOWN.value
+            return None
+        except Exception:
+            return None
 
     def _read_key_windows_msvcrt(self) -> Optional[str]:
         """Non-blocking, no-echo key read via msvcrt (real TTY only)."""
