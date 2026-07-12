@@ -2,6 +2,7 @@
 
 from typing import AsyncIterator
 import litellm
+import os
 
 from harness.config import LLMSettings
 
@@ -19,24 +20,40 @@ class LLMClient:
 
     async def stream(self, prompt: str, model: str | None = None) -> AsyncIterator[str]:
         """Stream completion using configured model and provider (or override model)."""
-        if not self.settings.api_key:
-            raise LLMConfigError("API key not configured")
+        # if not self.settings.api_key and not self.settings.auth_token:
+        #     raise LLMConfigError("API key and auth_token not configured")
         if not self.settings.model and not model:
             raise LLMConfigError("Model not configured")
+        try:
+            active_model = model or self.settings.model
 
-        active_model = model or self.settings.model
-        response = await litellm.acompletion(
-            model=active_model,
-            api_base=self.settings.api_base,
-            api_key=self.settings.api_key,
-            messages=[{"role": "user", "content": prompt}],
-            extra_headers={
-            "Authorization": f"Bearer {self.settings.auth_token}" # Your gateway's token
-            },
-            stream=True,
-        )
 
-        async for chunk in response:
-            content = chunk.choices[0].delta.content if chunk.choices else None
-            if content:
-                yield content
+            # Build kwargs, include auth_token if present
+            kwargs = {
+                "model": f"openai/{active_model}",
+                "api_base": self.settings.api_base,
+                "api_key": self.settings.api_key or "none",
+                "messages": [{"role": "user", "content": prompt}],
+                "stream": True,
+                "extra_headers": {"Authorization": f"Bearer {self.settings.auth_token}"} if self.settings.auth_token else None,
+                "timeout": 30,
+            }
+
+            
+
+            response = await litellm.acompletion(**kwargs)
+
+            chunk_count = 0
+            async for chunk in response:
+                chunk_count += 1
+
+                # Extract content, handle different chunk formats
+                content = None
+                if hasattr(chunk, 'choices') and chunk.choices and len(chunk.choices) > 0:
+                    if hasattr(chunk.choices[0], 'delta'):
+                        content = chunk.choices[0].delta.content
+
+                if content:
+                    yield content
+        except Exception as LLM_EXC:
+            raise LLMConfigError(f"LLM streaming error: {str(LLM_EXC)}") from LLM_EXC
