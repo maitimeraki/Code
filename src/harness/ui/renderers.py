@@ -85,11 +85,38 @@ class OutputRenderer:
 
     @staticmethod
     def render_agent_thinking(text: str) -> Text:
-        """Render agent thinking."""
-        return Text(text, style="dim italic")
+        """Render agent thinking with icon."""
+        result = Text()
+        result.append("🧠 ", style=Styles.INFO)
+        result.append(text, style=Styles.AGENT_THINKING)
+        return result
+
+    @staticmethod
+    def render_tool_call(tool_name: str, params: dict = None) -> Text:
+        """Render tool call with icon and parameters."""
+        result = Text()
+        result.append("⚙️ ", style=Styles.INFO)
+        result.append(f"Tool Call: {tool_name}", style=Styles.TOOL_CALL)
+        if params:
+            result.append(f"({json.dumps(params, indent=2)})", style=Styles.INPUT_TEXT)
+        return result
 
     @staticmethod
     def render_tool_output(tool_name: str, output: str, is_error: bool = False) -> Text:
-        """Render tool output."""
+        """Render tool output with icon."""
+        result = Text()
+        result.append("📥 ", style=Styles.INFO)
         style = Styles.ERROR if is_error else Styles.SUCCESS
-        return Text(f"{tool_name}: {output}", style=style)
+        result.append(f"{tool_name}: {output}", style=style)
+        return result
+
+    @staticmethod
+    def render_event_tree(event_name: str, message: str, is_root: bool = True, indent: int = 0) -> Text:
+        """Render event in tree hierarchy with L-shaped indicator."""
+        indent_str = "  " * indent
+        tree_char = "L " if is_root else "├ "
+        result = Text()
+        result.append(indent_str + tree_char, style=Styles.BORDER)
+        result.append(event_name, style=Styles.TOOL_CALL)
+        result.append(f": {message}", style=Styles.INPUT_TEXT)
+        return result
