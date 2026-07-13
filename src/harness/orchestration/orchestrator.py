@@ -8,8 +8,10 @@ from harness.core.loop import LoopController
 from harness.core.models import TaskState, TaskStatus
 from harness.core.completion import CompletionChecker
 from harness.ui import TerminalUI, StreamListener, LogEntry, LogLevel
+from harness.config import get_settings
 from .agent import AgentConfig, AgentType
 from .spawner import AgentSpawner
+from .llm_client import LLMClient
 
 logger = structlog.get_logger(__name__)
 
@@ -20,7 +22,16 @@ class HarnessOrchestrator:
     def __init__(self, ui: Optional[TerminalUI] = None):
         self.ui = ui
         self.loop_controller = LoopController()
-        self.agent_spawner = AgentSpawner()
+
+        # Build shared LLMClient from settings
+        llm_client = LLMClient()
+
+        # Build AgentSpawner with settings-derived config
+        self.agent_spawner = AgentSpawner(
+            llm_client=llm_client,
+            max_parallel_agents=get_settings().max_parallel_agents,
+            tool_timeout_seconds=get_settings().tool_timeout_seconds,
+        )
         self.stream_listener = ui.stream_listener if ui else None
 
     def _log_to_ui(self, message: str, level: str = "info") -> None:
@@ -54,7 +65,11 @@ class HarnessOrchestrator:
                 task_description=state.task,
             )
 
-            result = await self.agent_spawner.spawn(config)
+            # Define callback to stream text deltas to UI
+            def on_text_delta(text: str) -> None:
+                self._log_to_ui(text, "agent_output")
+
+            result = await self.agent_spawner.spawn(config, on_text_delta=on_text_delta)
 
             if result.success:
                 self._log_to_ui(f"Agent result: {result.output}", "info")

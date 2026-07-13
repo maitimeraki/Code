@@ -2,8 +2,12 @@
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, TYPE_CHECKING
 from datetime import datetime
+from pathlib import Path
+
+if TYPE_CHECKING:
+    from harness.tools.permissions import PermissionScope
 
 
 class AgentType(Enum):
@@ -42,6 +46,15 @@ class AgentConfig:
     model: str = "claude-3-5-sonnet-20241022"
     temperature: float = 0.7
     max_tokens: int = 4096
+    permission_scope: Optional["PermissionScope"] = None
+    max_tool_iterations: int = 10
+    tool_token_budget: Optional[int] = None
+
+    def __post_init__(self) -> None:
+        """Initialize permission_scope with project defaults if not provided."""
+        if self.permission_scope is None:
+            from harness.tools.permissions import PermissionScope
+            self.permission_scope = PermissionScope.default_for_project(Path.cwd())
 
 
 @dataclass
