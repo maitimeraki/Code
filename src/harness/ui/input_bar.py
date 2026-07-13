@@ -2,9 +2,8 @@
 
 from dataclasses import dataclass, field
 from typing import List, Optional, Callable, Awaitable
-from rich.console import Console, Group
+from rich.console import Console
 from rich.text import Text
-from rich.rule import Rule
 from .claude_code_style import Styles
 
 
@@ -96,27 +95,18 @@ class InputBar:
         self.state.palette_buffer = ""
         self.state.hint = "< for agents"
 
-    def render(self) -> Group:
-        """Render input bar with pinned cursor and responsive status indicator."""
-        prompt_text = Text(no_wrap=True, overflow="ellipsis")
-
+    def render(self):
+        """Render input bar with cursor."""
         if self.state.in_palette_mode:
-            prompt_text.append(": ", style=Styles.PROMPT)
-            prompt_text.append(self.state.palette_buffer, style=Styles.INPUT_TEXT)
+            prefix = ": "
+            content = self.state.palette_buffer
         else:
-            prompt_text.append(") ", style=Styles.PROMPT)
-            prompt_text.append(self.state.buffer, style=Styles.INPUT_TEXT)
+            prefix = ") "
+            content = self.state.buffer
 
-        prompt_text.append("█", style=Styles.PROMPT)
-
-        hint_text = Text(self.state.hint, style=Styles.HINT)
-
-        return Group(
-            Rule(style=Styles.BORDER),
-            prompt_text,
-            Rule(style=Styles.BORDER),
-            hint_text,
-        )
+        # Simple output: just render the line with prompt, content, and cursor
+        line = f"{prefix}{content}█"
+        return Text(line, style="white on black")
 
     def get_current_input(self) -> str:
         """Get current input (either buffer or palette buffer)."""

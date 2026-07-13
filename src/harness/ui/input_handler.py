@@ -18,13 +18,15 @@ _WINDOWS_EXTENDED_KEY_MAP: Dict[str, str] = {
 }
 
 # Windows virtual key codes to synthetic key sequences (for console_api reader)
-_WINDOWS_VK_ARROW_MAP: Dict[int, str] = {
+_WINDOWS_VK_MAP: Dict[int, str] = {
     0x26: KeyCode.UP.value,         # VK_UP
     0x28: KeyCode.DOWN.value,       # VK_DOWN
     0x25: KeyCode.LEFT.value,       # VK_LEFT
     0x27: KeyCode.RIGHT.value,      # VK_RIGHT
-    0x21: KeyCode.PAGE_UP.value,    # VK_PRIOR
-    0x22: KeyCode.PAGE_DOWN.value,  # VK_NEXT
+    0x21: KeyCode.PAGE_UP.value,    # VK_PRIOR (Page Up)
+    0x22: KeyCode.PAGE_DOWN.value,  # VK_NEXT (Page Down)
+    0x0D: KeyCode.ENTER.value,      # VK_RETURN (Enter)
+    0x08: KeyCode.BACKSPACE.value,  # VK_BACK (Backspace)
 }
 
 
@@ -119,14 +121,17 @@ class InputHandler:
 
             if record.EventType == 0x0001:  # KEY_EVENT
                 key_event = record.Event.KeyEvent
-                # Try virtual key code first for arrow keys
                 vk = key_event.wVirtualKeyCode
-                if vk in _WINDOWS_VK_ARROW_MAP:
-                    return _WINDOWS_VK_ARROW_MAP[vk]
-                # Fall back to Unicode character (convert from c_wchar properly)
+
+                # Check virtual key map first (includes arrows, Enter, Backspace)
+                if vk in _WINDOWS_VK_MAP:
+                    return _WINDOWS_VK_MAP[vk]
+
+                # Fall back to Unicode character for printable characters
                 char_val = str(key_event.uChar) if key_event.uChar else ""
                 if char_val and ord(char_val) >= 32:  # Printable
                     return char_val
+
                 return None
             elif record.EventType == 0x0002:  # MOUSE_EVENT
                 mouse_event = record.Event.MouseEvent
@@ -196,8 +201,13 @@ class InputHandler:
 
     def is_text_input(self, key: str) -> bool:
         """Check if key is regular text (not a control key)."""
-        return (
-            not self.keybinds.is_modifier_key(key)
-            and len(key) == 1
-            and key.isprintable()
-        )
+        if not key or len(key) != 1:
+            return False
+        # Allow all printable ASCII/Unicode characters except control keys
+        if not key.isprintable():
+            return False
+        # Reject if it's a known modifier/control action
+        action = self.keybinds.get_action(key)
+        if action and action != "text_input":
+            return False
+        return True

@@ -18,20 +18,20 @@ class Colors:
 
 class Styles:
     """Text styles for Claude Code UI (Gruvbox theme)."""
-    TITLE = Style(color=Colors.ACCENT_BLUE, bold=True)
-    STATUS_BAR = Style(color=Colors.TEXT_DIM, bgcolor=Colors.BG)
-    PROMPT = Style(color=Colors.ACCENT_CORAL, bold=True)
-    INPUT_TEXT = Style(color=Colors.TEXT_PRIMARY, bgcolor=Colors.BG)
-    HINT = Style(color=Colors.TEXT_DIM, italic=True, bgcolor=Colors.BG)
-    WELCOME = Style(color=Colors.ACCENT_GOLD, bold=True)
-    SUCCESS = Style(color=Colors.ACCENT_GREEN, bold=True)
-    ERROR = Style(color=Colors.ACCENT_CORAL, bold=True)
-    INFO = Style(color=Colors.ACCENT_BLUE)
-    BORDER = Style(color=Colors.BORDER_CORAL)
-    PATH = Style(color=Colors.ACCENT_GREEN, dim=True)
-    VERSION = Style(color=Colors.ACCENT_GOLD, bold=True)
-    TOOL_CALL = Style(color=Colors.ACCENT_BLUE, bold=True)
-    AGENT_THINKING = Style(color=Colors.ACCENT_CYAN, italic=True)
+    TITLE = Style(color="cyan", bold=True)
+    STATUS_BAR = Style(color="white", bgcolor="black")
+    PROMPT = Style(color="red", bold=True)
+    INPUT_TEXT = Style(color="white", bgcolor="black")
+    HINT = Style(color="white", italic=True, bgcolor="black")
+    WELCOME = Style(color="yellow", bold=True)
+    SUCCESS = Style(color="green", bold=True)
+    ERROR = Style(color="red", bold=True)
+    INFO = Style(color="blue")
+    BORDER = Style(color="red")
+    PATH = Style(color="green", dim=True)
+    VERSION = Style(color="yellow", bold=True)
+    TOOL_CALL = Style(color="cyan", bold=True)
+    AGENT_THINKING = Style(color="green", italic=True)
 
 
 def create_console() -> Console:

@@ -84,7 +84,7 @@ class ConsoleInputReader:
         try:
             # Get STDIN handle
             kernel32 = ctypes.windll.kernel32
-            self.stdin_handle = kernel32.GetStdHandle(-11)  # STD_INPUT_HANDLE
+            self.stdin_handle = kernel32.GetStdHandle(-10)  # STD_INPUT_HANDLE = -10
 
             if self.stdin_handle == -1 or not self.stdin_handle:
                 return
