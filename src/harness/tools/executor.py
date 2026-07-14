@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 
 from .models import ToolCall, ToolType, ToolStatus, ToolResult
 from .router import ToolRouter
+from harness.config import get_settings
 
 logger = structlog.get_logger(__name__)
 
@@ -15,20 +16,23 @@ logger = structlog.get_logger(__name__)
 class ToolExecutor:
     """Execute tools with retry, caching, and circuit breaker."""
 
-    def __init__(self, router: ToolRouter):
+    def __init__(self, router: ToolRouter, tool_timeout_seconds: Optional[int] = None):
         self.router = router
         self.cache: Dict[str, tuple[Any, datetime]] = {}
         self.cache_ttl = timedelta(hours=1)
+        self.tool_timeout_seconds = tool_timeout_seconds or get_settings().tool_timeout_seconds
         self.retry_config = {
             ToolType.READ: {"max_retries": 2, "backoff": 0.5},
             ToolType.WRITE: {"max_retries": 1, "backoff": 1.0},
+            ToolType.EDIT: {"max_retries": 1, "backoff": 0.5},
             ToolType.BASH: {"max_retries": 3, "backoff": 0.5},
             ToolType.GREP: {"max_retries": 2, "backoff": 0.5},
             ToolType.GLOB: {"max_retries": 1, "backoff": 0.5},
         }
         self.circuit_breaker_threshold = 5
         self.circuit_breaker_reset_time = 60
-        self.failed_attempts = {}
+        self.failed_attempts: Dict[ToolType, int] = {}
+        self.circuit_opened_at: Dict[ToolType, datetime] = {}
 
     def _cache_key(self, tool_type: ToolType, **kwargs) -> str:
         """Generate cache key for tool call."""
@@ -47,12 +51,17 @@ class ToolExecutor:
         """Execute tool with retry and caching."""
         cache_key = self._cache_key(tool_type, **kwargs)
 
-        # Check circuit breaker
+        # Check circuit breaker (with time-based reset for half-open retry)
         if self.failed_attempts.get(tool_type, 0) >= self.circuit_breaker_threshold:
-            logger.warning(f"Circuit breaker open for {tool_type.value}")
-            result = await self.router.call(tool_type, **kwargs)
-            result.tool_call.error = "Circuit breaker open"
-            return result
+            opened_at = self.circuit_opened_at.get(tool_type)
+            if opened_at and datetime.now() - opened_at > timedelta(seconds=self.circuit_breaker_reset_time):
+                logger.info(f"Circuit breaker half-open for {tool_type.value}, attempting reset")
+                self.reset_circuit_breaker(tool_type)
+            else:
+                logger.warning(f"Circuit breaker open for {tool_type.value}")
+                result = await self.router.call(tool_type, **kwargs)
+                result.tool_call.error = "Circuit breaker open"
+                return result
 
         # Check cache
         if cache_key in self.cache:
@@ -81,7 +90,10 @@ class ToolExecutor:
         last_result = None
         for attempt in range(max_retries + 1):
             try:
-                result = await self.router.call(tool_type, **kwargs)
+                result = await asyncio.wait_for(
+                    self.router.call(tool_type, **kwargs),
+                    timeout=self.tool_timeout_seconds
+                )
                 result.retry_count = attempt
                 result.total_retries = max_retries
 
@@ -102,6 +114,16 @@ class ToolExecutor:
                     )
                     await asyncio.sleep(wait_time)
 
+            except asyncio.TimeoutError:
+                logger.error(f"Tool call timed out after {self.tool_timeout_seconds}s: {tool_type.value}")
+                last_result = ToolResult(
+                    tool_call=ToolCall(
+                        tool_type=tool_type,
+                        args=kwargs,
+                        status=ToolStatus.TIMEOUT,
+                        error=f"Tool execution timed out after {self.tool_timeout_seconds}s",
+                    )
+                )
             except Exception as e:
                 logger.error(f"Unexpected error in execute: {e}")
                 last_result = ToolResult(
@@ -113,9 +135,12 @@ class ToolExecutor:
                     )
                 )
 
-        # All retries failed
+        # All retries failed — update circuit breaker tracking
         if last_result:
-            self.failed_attempts[tool_type] = self.failed_attempts.get(tool_type, 0) + 1
+            failed_count = self.failed_attempts.get(tool_type, 0) + 1
+            self.failed_attempts[tool_type] = failed_count
+            if failed_count >= self.circuit_breaker_threshold:
+                self.circuit_opened_at[tool_type] = datetime.now()
             return last_result
 
         return ToolResult(

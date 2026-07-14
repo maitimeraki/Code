@@ -2,7 +2,7 @@
 
 import asyncio
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Callable, Awaitable, Any
 import structlog
 
 logger = structlog.get_logger(__name__)
@@ -88,12 +88,29 @@ async def bash_exec(command: str, timeout: int = 30) -> str:
 
 
 async def grep_search(pattern: str, path: str = ".") -> str:
-    """Search for pattern in files."""
+    """Search for pattern in files using grep directly (no shell)."""
     try:
-        command = f'grep -r "{pattern}" "{path}"'
-        result = await bash_exec(command, timeout=10)
+        proc = await asyncio.create_subprocess_exec(
+            "grep", "-rn", pattern, path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
+        except asyncio.TimeoutError:
+            proc.kill()
+            raise TimeoutError(f"Grep search timed out after 10s: {pattern}")
+
+        output = stdout.decode(errors="replace")
+        error = stderr.decode(errors="replace")
+
+        if stderr and proc.returncode != 0:
+            logger.warning(f"Grep search failed: {pattern}", returncode=proc.returncode)
+            return error
+
         logger.info(f"Grep search: {pattern}")
-        return result
+        return output
 
     except Exception as e:
         logger.error(f"Grep failed: {pattern}", error=str(e))
@@ -113,3 +130,46 @@ async def glob_search(pattern: str, path: str = ".") -> str:
     except Exception as e:
         logger.error(f"Glob failed: {pattern}", error=str(e))
         raise
+from harness.registry.definitions import AgentRegistry
+from harness.orchestration.agent import AgentConfig
+# from harness.app import AgentRegistry, AgentConfig
+def make_spawn_agent_handler(
+    agent_registry: "AgentRegistry",
+    spawn_fn: Callable[["AgentConfig"], Awaitable[Any]],
+    parent_config: "AgentConfig",
+) -> Callable[[str, str], Awaitable[str]]:
+    """Create a spawn_agent handler with closure over registry and spawner context."""
+    from harness.orchestration.agent import MAX_SPAWN_DEPTH
+
+    async def spawn_agent(name: str, task: str) -> str:
+        """Delegate a task to a named sub-agent in an isolated context."""
+        if parent_config.spawn_depth >= MAX_SPAWN_DEPTH:
+            raise PermissionError(
+                f"Max agent spawn depth ({MAX_SPAWN_DEPTH}) reached; cannot spawn '{name}'"
+            )
+
+        available = {a.name for a in agent_registry.list_agents()}
+        if name not in available:
+            raise ValueError(f"Unknown agent '{name}'. Available: {', '.join(sorted(available))}")
+
+        system_prompt = agent_registry.get_full(name)
+
+        child_config = AgentConfig(
+            agent_type=name,
+            task_description=task,
+            system_prompt=system_prompt,
+            project_context=parent_config.project_context,
+            agent_registry=parent_config.agent_registry,
+            skill_registry=parent_config.skill_registry,
+            permission_scope=parent_config.permission_scope,
+            spawn_depth=parent_config.spawn_depth + 1,
+            model=parent_config.model,
+            max_tool_iterations=parent_config.max_tool_iterations,
+        )
+
+        result = await spawn_fn(child_config)
+        if not result.success:
+            return f"Sub-agent '{name}' failed: {result.error}"
+        return result.output or "(sub-agent produced no output)"
+
+    return spawn_agent

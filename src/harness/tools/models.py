@@ -16,6 +16,7 @@ class ToolType(Enum):
     GLOB = "glob"
     GIT = "git"
     HTTP = "http"
+    SPAWN_AGENT = "spawn_agent"
 
 
 class ToolStatus(Enum):
@@ -64,7 +65,7 @@ class ToolResult:
 @dataclass
 class ToolBudget:
     """Context budget tracking for tool calls."""
-    total_tokens: int = 1000000
+    total_tokens: int = 200000
     tokens_used: int = 0
     max_concurrent_tools: int = 16
 
