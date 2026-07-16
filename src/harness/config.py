@@ -41,9 +41,11 @@ def load_settings_file() -> dict[str, Any]:
             with open(settings_path, "r", encoding="utf-8") as f:
                 _settings_file_cache = json.load(f)  
         except (json.JSONDecodeError, OSError):
+            print("Line:44")
             _settings_file_cache = {"env": dict(_DEFAULT_ENV_BLOCK)}
     else:
         _settings_file_cache = {"env": dict(_DEFAULT_ENV_BLOCK)}
+        print("Line:48")
         try:
             settings_path.write_text(json.dumps(_settings_file_cache, indent=2))
         except OSError:

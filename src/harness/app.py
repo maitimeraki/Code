@@ -27,6 +27,9 @@ class HarnessApp:
         llm_client = LLMClient()
         self.ui = TerminalUI(llm_client=llm_client)
         self.orchestrator = HarnessOrchestrator(ui=self.ui)
+        # Route interactive chat through the main orchestrator agent (real tools + delegation).
+        self.ui.orchestrator = self.orchestrator
+        self.ui.system_prompt = self.orchestrator.compose_system_message()
         self.auto_command = auto_command
 
     async def run(self) -> None:
