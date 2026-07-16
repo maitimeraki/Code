@@ -1,12 +1,16 @@
 """Harness orchestrator - main integration point."""
 
 import asyncio
+from pathlib import Path
 from typing import Optional
 import structlog
 
 from harness.core.loop import LoopController
 from harness.core.models import TaskState, TaskStatus
 from harness.core.completion import CompletionChecker
+from harness.context.project_context import load_project_context
+from harness.registry.definitions import AgentRegistry, SkillRegistry, ensure_seed_agents
+from harness.tools.permissions import PermissionScope
 from harness.ui import TerminalUI, StreamListener, LogEntry, LogLevel
 from harness.config import get_settings
 from .agent import AgentConfig, AgentType
@@ -23,16 +27,42 @@ class HarnessOrchestrator:
         self.ui = ui
         self.loop_controller = LoopController()
 
+        settings = get_settings()
+
+        # Load project context once
+        self.project_context = load_project_context(Path.cwd(), settings)
+
+        # Build registries
+        self.agent_registry = AgentRegistry(settings.get_agents_dir)
+        self.skill_registry = SkillRegistry(settings.get_skills_dir)
+        ensure_seed_agents(settings)
+        self.agent_registry.scan()
+        self.skill_registry.scan()
+
         # Build shared LLMClient from settings
         llm_client = LLMClient()
 
-        # Build AgentSpawner with settings-derived config
+        # Get stream listener from UI if available
+        self.stream_listener = ui.stream_listener if ui else None
+
+        # Build AgentSpawner with settings-derived config and stream listener
         self.agent_spawner = AgentSpawner(
             llm_client=llm_client,
-            max_parallel_agents=get_settings().max_parallel_agents,
-            tool_timeout_seconds=get_settings().tool_timeout_seconds,
+            max_parallel_agents=settings.max_parallel_agents,
+            tool_timeout_seconds=settings.tool_timeout_seconds,
+            stream_listener=self.stream_listener,
         )
-        self.stream_listener = ui.stream_listener if ui else None
+
+    def compose_system_message(self) -> str:
+        """Compose the chat system message from loaded project context + registries."""
+        from .spawner import _compose_system_message
+        return _compose_system_message(AgentConfig(
+            agent_type="chat",
+            task_description="",
+            project_context=self.project_context,
+            agent_registry=self.agent_registry,
+            skill_registry=self.skill_registry,
+        ))
 
     def _log_to_ui(self, message: str, level: str = "info") -> None:
         """Log message to UI stream."""
@@ -59,13 +89,24 @@ class HarnessOrchestrator:
             """Execute agents for current iteration."""
             self._log_to_ui(f"Executing iteration {state.iteration}", "info")
 
-            # Example: Spawn an architect agent
+            agents = {a.name for a in self.agent_registry.list_agents()}
+            default_agent = "architect" if "architect" in agents else (
+                next(iter(agents)) if agents else None
+            )
+            if default_agent is None:
+                self._log_to_ui("No agents available in registry", "error")
+                return
+
             config = AgentConfig(
-                agent_type=AgentType.ARCHITECT,
-                task_description=state.task,
+                agent_type=default_agent,
+                task_description=state.description,
+                system_prompt=self.agent_registry.get_full(default_agent),
+                project_context=self.project_context,
+                agent_registry=self.agent_registry,
+                skill_registry=self.skill_registry,
+                permission_scope=PermissionScope.default_for_project(self.project_context.root),
             )
 
-            # Define callback to stream text deltas to UI
             def on_text_delta(text: str) -> None:
                 self._log_to_ui(text, "agent_output")
 
@@ -91,7 +132,7 @@ class HarnessOrchestrator:
 
         state = TaskState(
             task_id="task_001",
-            task=task_description,
+            description=task_description,
             max_iterations=3,
         )
 

@@ -2,12 +2,16 @@
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional, Dict, Any, TYPE_CHECKING
+from typing import Optional, Dict, Any, TYPE_CHECKING, Union
 from datetime import datetime
 from pathlib import Path
 
 if TYPE_CHECKING:
     from harness.tools.permissions import PermissionScope
+    from harness.context.project_context import ProjectContext
+    from harness.registry.definitions import AgentRegistry, SkillRegistry
+
+MAX_SPAWN_DEPTH = 3
 
 
 class AgentType(Enum):
@@ -38,7 +42,7 @@ class AgentStatus(Enum):
 @dataclass
 class AgentConfig:
     """Configuration for spawning an agent."""
-    agent_type: AgentType
+    agent_type: Union[AgentType, str]
     task_description: str
     context: Dict[str, Any] = field(default_factory=dict)
     max_retries: int = 3
@@ -49,18 +53,24 @@ class AgentConfig:
     permission_scope: Optional["PermissionScope"] = None
     max_tool_iterations: int = 10
     tool_token_budget: Optional[int] = None
+    system_prompt: Optional[str] = None
+    project_context: Optional["ProjectContext"] = None
+    agent_registry: Optional["AgentRegistry"] = None
+    skill_registry: Optional["SkillRegistry"] = None
+    spawn_depth: int = 0
 
     def __post_init__(self) -> None:
-        """Initialize permission_scope with project defaults if not provided."""
+        """Initialize permission_scope and agent_name."""
         if self.permission_scope is None:
             from harness.tools.permissions import PermissionScope
             self.permission_scope = PermissionScope.default_for_project(Path.cwd())
+        self.agent_name: str = self.agent_type.value if isinstance(self.agent_type, AgentType) else str(self.agent_type)
 
 
 @dataclass
 class AgentResult:
     """Result from agent execution."""
-    agent_type: AgentType
+    agent_type: Union[AgentType, str]
     status: AgentStatus
     output: Optional[str] = None
     error: Optional[str] = None

@@ -1,9 +1,11 @@
 """Agent spawner with multi-LLM fallback support and real tool-calling loop."""
 
 import asyncio
-from typing import Optional, Callable
+from typing import Optional, Callable, TYPE_CHECKING
 from datetime import datetime
+import platform
 import structlog
+import json
 
 from .agent import AgentConfig, AgentResult, AgentStatus, AgentType
 from .llm_client import LLMClient, TextDelta, ToolCallsReady, StreamDone
@@ -13,7 +15,52 @@ from harness.tools.executor import ToolExecutor
 from harness.config import get_settings
 from pydantic import ValidationError
 
+if TYPE_CHECKING:
+    from harness.ui.stream_listener import StreamListener
+
 logger = structlog.get_logger(__name__)
+
+
+def _compose_system_message(config: "AgentConfig") -> str:
+    """Compose final system message from agent config, project context, registries.
+
+    Assembles: agent instructions, environment info, project memory, available agents/skills.
+    """
+    parts = []
+
+    if config.system_prompt:
+        parts.append(config.system_prompt)
+
+    if config.project_context:
+        env_block = f"""<environment>
+project_root: {config.project_context.root}
+platform: {platform.system()}
+date: {datetime.now().strftime('%Y-%m-%d')}
+</environment>"""
+        parts.append(env_block)
+
+        if config.project_context.memory_text:
+            parts.append(f"""<project_memory>
+{config.project_context.memory_text}
+</project_memory>""")
+
+    if config.agent_registry:
+        agents = config.agent_registry.list_agents()
+        if agents:
+            agent_lines = "\n".join(f"- {a.name}: {a.description}" for a in agents)
+            parts.append(f"""<available_agents>
+{agent_lines}
+</available_agents>""")
+
+    if config.skill_registry:
+        skills = config.skill_registry.list_skills()
+        if skills:
+            skill_lines = "\n".join(f"- {s.name}: {s.description}" for s in skills)
+            parts.append(f"""<available_skills>
+{skill_lines}
+</available_skills>""")
+
+    return "\n\n".join(parts)
 
 
 class AgentSpawner:
@@ -24,10 +71,12 @@ class AgentSpawner:
         llm_client: Optional[LLMClient] = None,
         max_parallel_agents: Optional[int] = None,
         tool_timeout_seconds: Optional[int] = None,
+        stream_listener: Optional["StreamListener"] = None,
     ):
         self.llm_client = llm_client or LLMClient()
         self.max_parallel_agents = max_parallel_agents or get_settings().max_parallel_agents
         self.tool_timeout_seconds = tool_timeout_seconds or get_settings().tool_timeout_seconds
+        self.stream_listener = stream_listener
         self.results = {}
 
     async def spawn(
@@ -52,20 +101,37 @@ class AgentSpawner:
             result.status = AgentStatus.RUNNING
             logger.info(
                 "Spawning agent",
-                agent_type=config.agent_type.value,
+                agent_name=config.agent_name,
                 task=config.task_description[:100],
             )
 
+            # Emit agent start event
+            if self.stream_listener:
+                from harness.ui.stream_listener import LogLevel
+                await self.stream_listener.log_agent_output(
+                    f"Agent '{config.agent_name}' spawning...",
+                    level=LogLevel.INFO,
+                )
+
             # Build scoped router + executor (fresh per spawn for isolation)
             scope = config.permission_scope
-            router = build_scoped_router(scope)
+            router = build_scoped_router(
+                scope,
+                agent_registry=config.agent_registry,
+                spawn_fn=self.spawn,
+                parent_config=config,
+            )
             executor = ToolExecutor(router, tool_timeout_seconds=self.tool_timeout_seconds)
 
             # Build tools payload for LLM
-            tools_payload = get_tools_payload(router) if router.handlers else None
+            tools_payload = get_tools_payload(router, agent_registry=config.agent_registry) if router.handlers else None
 
-            # Initialize messages with user task
-            messages = [{"role": "user", "content": config.task_description}]
+            # Initialize messages with optional system prompt and project context
+            messages = []
+            system_content = _compose_system_message(config)
+            if system_content:
+                messages.append({"role": "system", "content": system_content})
+            messages.append({"role": "user", "content": config.task_description})
 
             # Tool-calling loop
             for iteration in range(config.max_tool_iterations):
@@ -81,20 +147,23 @@ class AgentSpawner:
                         assistant_text = ""
                         tool_calls_this_turn = []
 
-                        async for event in self.llm_client.stream_with_tools(
+                        async for event in self.llm_client.stream(
                             messages=messages,
                             tools=tools_payload,
                             model=config.model,
-                            fallback_models=[
-                                get_settings().code_standard_model,
-                                get_settings().code_pro_model,
-                                get_settings().code_max_model,
-                            ],
+                            fallback_models=None,
                         ):
                             if isinstance(event, TextDelta):
                                 assistant_text += event.content
                                 if on_text_delta:
                                     on_text_delta(event.content)
+                                # Emit LLM response to stream listener
+                                if self.stream_listener:
+                                    from harness.ui.stream_listener import LogLevel
+                                    await self.stream_listener.log_agent_output(
+                                        event.content,
+                                        level=LogLevel.INFO,
+                                    )
                             elif isinstance(event, ToolCallsReady):
                                 tool_calls_this_turn = event.tool_calls
                             elif isinstance(event, StreamDone):
@@ -153,6 +222,19 @@ class AgentSpawner:
                         tool_error = None
                         tool_result = None
 
+                        # Emit tool call start event
+                        if self.stream_listener:
+                            from harness.ui.stream_listener import LogLevel
+                            try:
+                                args = json.loads(tool_call.arguments) if isinstance(tool_call.arguments, str) else tool_call.arguments
+                            except (json.JSONDecodeError, TypeError):
+                                args = {"raw": tool_call.arguments}
+
+                            await self.stream_listener.log_tool_call(
+                                tool_name=tool_call.name,
+                                args=args,
+                            )
+
                         try:
                             # Map name to ToolType
                             tool_type = None
@@ -184,6 +266,15 @@ class AgentSpawner:
                             tool_error = f"Tool execution error: {str(e)}"
                             logger.error(tool_error, tool=tool_call.name)
 
+                        # Emit tool result event
+                        if self.stream_listener:
+                            await self.stream_listener.log_tool_call(
+                                tool_name=tool_call.name,
+                                args={},  # Already logged in call start
+                                result=tool_result.tool_call.result if tool_result else None,
+                                error=tool_error,
+                            )
+
                         # Append tool result to messages
                         messages.append(
                             {
@@ -206,9 +297,18 @@ class AgentSpawner:
                     result.status = AgentStatus.COMPLETED
                     result.output = assistant_text
                     result.tokens_used += len(assistant_text.split())
+
+                    # Emit completion event
+                    if self.stream_listener:
+                        from harness.ui.stream_listener import LogLevel
+                        await self.stream_listener.log_agent_output(
+                            f"Agent '{config.agent_name}' completed in {result.iterations} iteration(s)",
+                            level=LogLevel.INFO,
+                        )
+
                     logger.info(
                         "Agent completed",
-                        agent_type=config.agent_type.value,
+                        agent_name=config.agent_name,
                         iterations=result.iterations,
                         tokens=result.tokens_used,
                     )
@@ -223,7 +323,7 @@ class AgentSpawner:
 
         except asyncio.CancelledError:
             result.status = AgentStatus.CANCELLED
-            logger.info("Agent cancelled", agent_type=config.agent_type.value)
+            logger.info("Agent cancelled", agent_name=config.agent_name)
             raise
 
         except Exception as e:
@@ -232,7 +332,7 @@ class AgentSpawner:
             result.error = str(e)
             logger.error(
                 "Agent failed",
-                agent_type=config.agent_type.value,
+                agent_name=config.agent_name,
                 error=str(e),
             )
 
