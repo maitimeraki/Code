@@ -56,13 +56,42 @@ class HarnessOrchestrator:
     def compose_system_message(self) -> str:
         """Compose the chat system message from loaded project context + registries."""
         from .spawner import _compose_system_message
-        return _compose_system_message(AgentConfig(
-            agent_type="chat",
-            task_description="",
+        settings = get_settings()
+        return _compose_system_message(
+            AgentConfig(
+                agent_type="chat",
+                task_description="",
+                project_context=self.project_context,
+                agent_registry=self.agent_registry,
+                skill_registry=self.skill_registry,
+                is_orchestrator=True,
+            ),
+            settings,
+        )
+
+    def _build_main_agent_config(self, task_description: str) -> AgentConfig:
+        """Build the top-level (orchestrator) agent config: full roster + tools + spawn.
+
+        This is the ONE agent that sees available agents/skills and may delegate.
+        """
+        return AgentConfig(
+            agent_type="main",
+            task_description=task_description,
             project_context=self.project_context,
             agent_registry=self.agent_registry,
             skill_registry=self.skill_registry,
-        ))
+            permission_scope=PermissionScope.default_for_project(self.project_context.root),
+            is_orchestrator=True,
+        )
+
+    async def chat(self, prompt: str, on_text_delta=None):
+        """Handle an interactive chat prompt through the main orchestrator agent.
+
+        Routes chat through the same tool-calling agent path as tasks so the model
+        can actually read/write/run commands and delegate to sub-agents.
+        """
+        config = self._build_main_agent_config(prompt)
+        return await self.agent_spawner.spawn(config, on_text_delta=on_text_delta)
 
     def _log_to_ui(self, message: str, level: str = "info") -> None:
         """Log message to UI stream."""
@@ -105,6 +134,7 @@ class HarnessOrchestrator:
                 agent_registry=self.agent_registry,
                 skill_registry=self.skill_registry,
                 permission_scope=PermissionScope.default_for_project(self.project_context.root),
+                is_orchestrator=True,
             )
 
             def on_text_delta(text: str) -> None:

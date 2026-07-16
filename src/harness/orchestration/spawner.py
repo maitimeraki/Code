@@ -21,16 +21,34 @@ if TYPE_CHECKING:
 logger = structlog.get_logger(__name__)
 
 
-def _compose_system_message(config: "AgentConfig") -> str:
-    """Compose final system message from agent config, project context, registries.
+def _compose_system_message(config: "AgentConfig", settings=None) -> str:
+    """Compose final system message from static manual, persona, context, and (for the
+    orchestrator only) the agent/skill roster.
 
-    Assembles: agent instructions, environment info, project memory, available agents/skills.
+    Layers, in order:
+      [1] static operating manual   — every agent
+      [2] agent persona             — every agent (config.system_prompt)
+      [3] dynamic context           — every agent (environment + project memory)
+      [4] orchestration context     — MAIN AGENT ONLY (available agents + skills)
+
+    Sub-agents (is_orchestrator=False) never receive layer [4]: decomposition and
+    delegation are the orchestrator's job. A sub-agent gets a self-contained task.
     """
+    if settings is None:
+        from harness.config import get_settings
+        settings = get_settings()
+
     parts = []
 
+    # [1] Static operating manual — same for every agent.
+    from harness.prompts.system import build_operating_prompt
+    parts.append(build_operating_prompt(settings))
+
+    # [2] Agent persona.
     if config.system_prompt:
         parts.append(config.system_prompt)
 
+    # [3] Dynamic per-run context.
     if config.project_context:
         env_block = f"""<environment>
 project_root: {config.project_context.root}
@@ -44,19 +62,21 @@ date: {datetime.now().strftime('%Y-%m-%d')}
 {config.project_context.memory_text}
 </project_memory>""")
 
-    if config.agent_registry:
-        agents = config.agent_registry.list_agents()
-        if agents:
-            agent_lines = "\n".join(f"- {a.name}: {a.description}" for a in agents)
-            parts.append(f"""<available_agents>
+    # [4] Orchestration context — ONLY the main agent may see the roster and delegate.
+    if config.is_orchestrator:
+        if config.agent_registry:
+            agents = config.agent_registry.list_agents()
+            if agents:
+                agent_lines = "\n".join(f"- {a.name}: {a.description}" for a in agents)
+                parts.append(f"""<available_agents>
 {agent_lines}
 </available_agents>""")
 
-    if config.skill_registry:
-        skills = config.skill_registry.list_skills()
-        if skills:
-            skill_lines = "\n".join(f"- {s.name}: {s.description}" for s in skills)
-            parts.append(f"""<available_skills>
+        if config.skill_registry:
+            skills = config.skill_registry.list_skills()
+            if skills:
+                skill_lines = "\n".join(f"- {s.name}: {s.description}" for s in skills)
+                parts.append(f"""<available_skills>
 {skill_lines}
 </available_skills>""")
 
@@ -123,8 +143,10 @@ class AgentSpawner:
             )
             executor = ToolExecutor(router, tool_timeout_seconds=self.tool_timeout_seconds)
 
-            # Build tools payload for LLM
-            tools_payload = get_tools_payload(router, agent_registry=config.agent_registry) if router.handlers else None
+            # Build tools payload for LLM (normalize empty → None so we never send tools=[])
+            tools_payload = None
+            if router.handlers:
+                tools_payload = get_tools_payload(router, agent_registry=config.agent_registry) or None
 
             # Initialize messages with optional system prompt and project context
             messages = []
@@ -155,15 +177,12 @@ class AgentSpawner:
                         ):
                             if isinstance(event, TextDelta):
                                 assistant_text += event.content
+                                # Only the top-level orchestrator streams its reply
+                                # text to the UI (via on_text_delta → the reply line).
+                                # Sub-agents get no callback, so their prose is never
+                                # shown — only their tool calls are surfaced below.
                                 if on_text_delta:
                                     on_text_delta(event.content)
-                                # Emit LLM response to stream listener
-                                if self.stream_listener:
-                                    from harness.ui.stream_listener import LogLevel
-                                    await self.stream_listener.log_agent_output(
-                                        event.content,
-                                        level=LogLevel.INFO,
-                                    )
                             elif isinstance(event, ToolCallsReady):
                                 tool_calls_this_turn = event.tool_calls
                             elif isinstance(event, StreamDone):

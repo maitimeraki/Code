@@ -47,7 +47,7 @@ class AgentConfig:
     context: Dict[str, Any] = field(default_factory=dict)
     max_retries: int = 3
     timeout_seconds: int = 300
-    model: str = "claude-3-5-sonnet-20241022"
+    model: str = ""
     temperature: float = 0.7
     max_tokens: int = 4096
     permission_scope: Optional["PermissionScope"] = None
@@ -58,6 +58,7 @@ class AgentConfig:
     agent_registry: Optional["AgentRegistry"] = None
     skill_registry: Optional["SkillRegistry"] = None
     spawn_depth: int = 0
+    is_orchestrator: bool = False
 
     def __post_init__(self) -> None:
         """Initialize permission_scope and agent_name."""

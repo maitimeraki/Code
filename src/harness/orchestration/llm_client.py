@@ -82,15 +82,17 @@ class LLMClient:
                     "api_base": self.settings.api_base,
                     "api_key": self.settings.api_key or "none",
                     "messages": messages,
-                    "tools": tools,
-                    "tool_choice": "auto" if tools else None,
                     "stream": True,
                     "extra_headers": {"Authorization": f"Bearer {self.settings.auth_token}"}
                     if self.settings.auth_token
                     else None,
                     "timeout": 30,
                 }
-                print(f"List of tools :{tools}")
+                # Only send tools/tool_choice when there are tools. Passing None
+                # trips some OpenAI-compatible endpoints (they echo nulls back).
+                if tools:
+                    kwargs["tools"] = tools
+                    kwargs["tool_choice"] = "auto"
 
                 response = await litellm.acompletion(**kwargs)
 
@@ -169,23 +171,29 @@ class LLMClient:
 
                         # Handle text content
                         if choice.delta is not None and "content" in choice.delta:
-                            
+
                             content = choice.delta.content
                             if content:
                                 text_started = True
                                 yield TextDelta(content=content)
 
-                        # Handle tool calls
-                        if "delta" in choice and "tools_calls" in choice.delta:
+                        # Handle tool calls (streamed as fragments across chunks)
+                        if choice.delta is not None and getattr(choice.delta, "tool_calls", None):
                             for tc_delta in choice.delta.tool_calls:
                                 idx = tc_delta.index
                                 if idx not in accumulating:
                                     accumulating[idx] = {"arguments": ""}
 
-                                # Set id/name if present (only on first fragment)
+                                # Set id/name if present (only on first fragment).
+                                # Guard on truthiness: later fragments carry name=None,
+                                # which would otherwise wipe the real name and produce
+                                # a `"name": null` tool_call the API rejects (400).
                                 if hasattr(tc_delta, "id") and tc_delta.id:
                                     accumulating[idx]["id"] = tc_delta.id
-                                if hasattr(tc_delta, "function") and hasattr(tc_delta.function, "name"):
+                                if (
+                                    hasattr(tc_delta, "function")
+                                    and getattr(tc_delta.function, "name", None)
+                                ):
                                     accumulating[idx]["name"] = tc_delta.function.name
 
                                 # Accumulate arguments string
