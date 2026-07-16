@@ -154,14 +154,17 @@ def make_spawn_agent_handler(
 
         system_prompt = agent_registry.get_full(name)
 
+        # Sub-agents are strict executors: no roster, no skills, no re-delegation.
+        # The orchestrator owns decomposition and hands each child a self-contained task.
         child_config = AgentConfig(
             agent_type=name,
             task_description=task,
             system_prompt=system_prompt,
             project_context=parent_config.project_context,
-            agent_registry=parent_config.agent_registry,
-            skill_registry=parent_config.skill_registry,
-            permission_scope=parent_config.permission_scope,
+            is_orchestrator=False,
+            agent_registry=None,
+            skill_registry=None,
+            permission_scope=parent_config.permission_scope.without_agent_spawn(),
             spawn_depth=parent_config.spawn_depth + 1,
             model=parent_config.model,
             max_tool_iterations=parent_config.max_tool_iterations,

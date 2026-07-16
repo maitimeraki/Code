@@ -92,8 +92,13 @@ def build_scoped_router(
     router.register_handler(ToolType.GLOB, glob_search_guarded)
     
 
-    # SPAWN_AGENT — agent spawning with permission gate (only if params supplied)
-    if agent_registry is not None and spawn_fn is not None and parent_config is not None:
+    # SPAWN_AGENT — agent spawning with permission gate (only if scope allows AND params supplied)
+    if (
+        scope.allow_agent_spawn
+        and agent_registry is not None
+        and spawn_fn is not None
+        and parent_config is not None
+    ):
         async def spawn_agent_guarded(**kwargs: Any) -> str:
             if not scope.allow_agent_spawn:
                 raise PermissionError("Agent spawning is not allowed in this scope")

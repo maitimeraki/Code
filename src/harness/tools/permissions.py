@@ -1,7 +1,7 @@
 """Permission scope and sandbox enforcement for tool execution."""
 
 import shlex
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Literal
 
@@ -15,6 +15,7 @@ class PermissionScope:
     allowed_paths: list[Path] = field(default_factory=list)
     allow_write: bool = True
     allow_bash: bool = True
+    allow_agent_spawn: bool = True
     bash_allowlist: list[str] = field(
         default_factory=lambda: ["git", "pytest", "npm", "ls", "cat", "python", "find", "grep"]
     )
@@ -41,9 +42,19 @@ class PermissionScope:
             allowed_paths=allowed_paths,
             allow_write=perm_config.get("allowWrite", True),
             allow_bash=perm_config.get("allowBash", True),
+            allow_agent_spawn=perm_config.get("allowAgentSpawn", True),
             bash_allowlist=perm_config.get("bashAllowlist", cls().bash_allowlist),
             bash_denylist=perm_config.get("bashDenylist", cls().bash_denylist),
         )
+
+    def without_agent_spawn(self) -> "PermissionScope":
+        """Return a copy of this scope with agent spawning disabled.
+
+        Used to give sub-agents a scope that cannot re-delegate: dropping
+        allow_agent_spawn causes build_scoped_router to omit the spawn_agent
+        handler, which in turn removes the tool from the LLM payload.
+        """
+        return replace(self, allow_agent_spawn=False)
 
 
 class PathGuard:
