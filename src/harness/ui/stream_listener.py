@@ -40,7 +40,7 @@ class StreamListener:
     async def emit(self, entry: LogEntry) -> None:
         """Emit a log entry to all listeners."""
         try:
-            await self.log_buffer.put_nowait(entry)
+            self.log_buffer.put_nowait(entry)
         except asyncio.QueueFull:
             try:
                 self.log_buffer.get_nowait()
@@ -85,6 +85,59 @@ class StreamListener:
             timestamp=datetime.now(),
             level=level,
             source="tool",
+            message=message,
+            data=data,
+        )
+        await self.emit(entry)
+
+    async def log_skill_call(
+        self,
+        skill_name: str,
+        params: Optional[dict] = None,
+    ) -> None:
+        """Log a skill invocation."""
+        message = f"Skill: {skill_name}"
+        data = {"skill": skill_name, "params": params or {}}
+        entry = LogEntry(
+            timestamp=datetime.now(),
+            level=LogLevel.INFO,
+            source="skill",
+            message=message,
+            data=data,
+        )
+        await self.emit(entry)
+
+    async def log_agent_call(
+        self,
+        agent_name: str,
+        task: str,
+        iteration: Optional[int] = None,
+    ) -> None:
+        """Log an agent spawn."""
+        message = f"Agent: {agent_name}"
+        data = {"agent": agent_name, "task": task, "iteration": iteration}
+        entry = LogEntry(
+            timestamp=datetime.now(),
+            level=LogLevel.INFO,
+            source="agent_call",
+            message=message,
+            data=data,
+        )
+        await self.emit(entry)
+
+    async def log_agent_status(
+        self,
+        agent_name: str,
+        status: str,
+        detail: Optional[str] = None,
+    ) -> None:
+        """Log agent status change."""
+        message = f"Agent {agent_name}: {status}"
+        data = {"agent": agent_name, "status": status, "detail": detail}
+        entry = LogEntry(
+            timestamp=datetime.now(),
+            level=LogLevel.INFO,
+            source="agent_status",
             message=message,
             data=data,
         )

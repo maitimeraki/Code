@@ -20,9 +20,10 @@ from .command_actions import CommandActions
 from .stream_listener import StreamListener, LogEntry
 from .stream_aggregator import StreamAggregator
 from .renderers import OutputRenderer
+from .claude_code_style import BlockKind
 
 if TYPE_CHECKING:
-    from harness.orchestration.llm_client import LLMClient
+    from harness.orchestration.llm_client import LLMClient, TextDelta
 
 
 class TerminalUI:
@@ -43,6 +44,18 @@ class TerminalUI:
         # LLM client for chat input
         self.llm_client = llm_client
         self.current_model = llm_client.settings.model if llm_client else None
+        self.system_prompt: Optional[str] = None
+        # Orchestrator for routing chat through the main agent (set by HarnessApp).
+        # When present, chat gets real tools + delegation; else falls back to raw LLM.
+        self.orchestrator = None
+
+        # Active assistant text block: index into main_panel scrollback of the
+        # block currently accumulating streamed reply text, plus its raw markdown
+        # source. Reset to None whenever a tool/agent/skill event is rendered so
+        # the next reply text opens a *new* block below that event — this keeps
+        # text/tool/text output in true chronological order.
+        self._active_text_idx: Optional[int] = None
+        self._active_text_raw: str = ""
 
         # Phase 2B: Keyboard input
         self.keybinds = KeybindMap()
@@ -178,29 +191,66 @@ class TerminalUI:
     def _setup_stream_handlers(self) -> None:
         """Setup stream batch handler to update UI with specialized rendering per entry type."""
         async def on_batch(entries: list[LogEntry]):
-            """Handle a batch of log entries with type-aware rendering."""
+            """Handle a batch of log entries with type-aware rendering.
+
+            Each tool/agent/skill event is wrapped with its block marker and
+            closes any active assistant text block, so the next streamed reply
+            text opens a fresh block *below* the event (chronological order).
+            """
             for entry in entries:
                 # Route to specialized renderer based on entry source and data
                 if entry.source == "tool" and entry.data:
                     if entry.data.get("result") is None and entry.data.get("error") is None:
-                        # Tool call (args but no result yet)
-                        rendered = OutputRenderer.render_tool_call(
+                        # Tool call (args but no result yet) — 'C' block leader.
+                        # Text renderer (not the Panel variant) so it composes with
+                        # the marker and MainPanel's row-wrap windowing.
+                        inner = OutputRenderer.render_tool_call(
                             entry.data.get("tool", "unknown"),
-                            entry.data.get("args")
+                            entry.data.get("args", {}),
                         )
+                        rendered = self._wrap_block(BlockKind.TOOL, inner)
                     else:
-                        # Tool output (result or error arrived)
-                        rendered = OutputRenderer.render_tool_output(
-                            entry.data.get("tool", "unknown"),
-                            entry.data.get("result") or entry.data.get("error", ""),
-                            is_error=bool(entry.data.get("error"))
+                        # Tool output (result or error arrived) — joined under call with '⎿'.
+                        is_error = bool(entry.data.get("error"))
+                        content = entry.data.get("result") or entry.data.get("error", "")
+                        rendered = OutputRenderer.render_result_block(
+                            str(content), is_error=is_error
                         )
+                elif entry.source == "skill":
+                    # Skill invocation
+                    inner = OutputRenderer.render_skill_call(
+                        entry.data.get("skill", "unknown"),
+                        entry.data.get("params")
+                    )
+                    rendered = self._wrap_block(BlockKind.SKILL, inner)
+                elif entry.source == "agent_call":
+                    # Agent spawn
+                    inner = OutputRenderer.render_agent_call(
+                        entry.data.get("agent", "unknown"),
+                        entry.data.get("task", ""),
+                        entry.data.get("iteration")
+                    )
+                    rendered = self._wrap_block(BlockKind.AGENT, inner)
+                elif entry.source == "agent_status":
+                    # Agent status change
+                    inner = OutputRenderer.render_agent_status(
+                        entry.data.get("agent", "unknown"),
+                        entry.data.get("status", "UNKNOWN"),
+                        entry.data.get("detail", "")
+                    )
+                    rendered = self._wrap_block(BlockKind.AGENT, inner)
                 elif entry.source == "agent":
-                    # Agent reasoning/thinking
-                    rendered = OutputRenderer.render_agent_thinking(entry.message)
+                    # Agent reasoning/thinking (streaming LLM response)
+                    inner = OutputRenderer.render_llm_response_stream(
+                        entry.message,
+                        model="Agent"
+                    )
+                    rendered = self._wrap_block(BlockKind.AGENT, inner)
                 else:
                     # Fallback to generic log entry render for everything else
-                    rendered = OutputRenderer.render_log_entry(entry)
+                    rendered = self._wrap_block(
+                        BlockKind.SYSTEM, OutputRenderer.render_log_entry(entry)
+                    )
 
                 self.main_panel.add_text(rendered)
             self._dirty = True
@@ -407,30 +457,82 @@ class TerminalUI:
                 self.main_panel.add_error(f"Model '{model_name}' not found. Available: {', '.join(self.llm_client.settings.models)}")
         self._dirty = True
 
+    def _wrap_block(self, kind: str, inner):
+        """Wrap a Channel-B event render with its 'C' block marker.
+
+        Also closes any active assistant text block so the next streamed reply
+        text starts a new block *below* this event (preserves chronology).
+        """
+        self._active_text_idx = None
+        self._active_text_raw = ""
+        return OutputRenderer.render_block(kind, inner)
+
     async def _handle_llm_prompt(self, prompt: str) -> None:
-        """Stream LLM response for a prompt."""
-        if not self.llm_client:
+        """Stream LLM response for a prompt.
+
+        Prefers routing through the orchestrator's main agent (real tools +
+        delegation). Falls back to a raw LLM stream if no orchestrator is wired.
+        """
+        if not self.llm_client and not self.orchestrator:
             self.main_panel.add_error("LLM client not initialized")
             self._dirty = True
             return
 
-        model_label = self.current_model or self.llm_client.settings.model
-        self.main_panel.add_line(f"{model_label}: ", style="bold cyan")
-        idx = len(self.main_panel.state.lines) - 1
+        # Reset any stale active block; each prompt starts fresh.
+        self._active_text_idx = None
+        self._active_text_raw = ""
+
+        def append_chunk(chunk: str) -> None:
+            """Append a streamed text chunk to the active assistant block.
+
+            Opens a new 'C' markdown block at the scrollback tail if none is
+            active (e.g. at the start, or after a tool/agent event closed the
+            previous one), otherwise re-renders the block in place with the
+            accumulated raw markdown.
+            """
+            if not chunk:
+                return
+
+            if self._active_text_idx is None or self._active_text_idx >= len(self.main_panel.state.lines):
+                # Open a new assistant block at the tail.
+                self._active_text_raw = chunk
+                rendered = OutputRenderer.render_block(
+                    BlockKind.ASSISTANT, self._active_text_raw, markdown=True
+                )
+                self.main_panel.add_text(rendered)
+                self._active_text_idx = len(self.main_panel.state.lines) - 1
+            else:
+                # Re-render the active block with accumulated markdown.
+                self._active_text_raw += chunk
+                self.main_panel.state.lines[self._active_text_idx] = OutputRenderer.render_block(
+                    BlockKind.ASSISTANT, self._active_text_raw, markdown=True
+                )
+            self._dirty = True
 
         try:
-            async for chunk in self.llm_client.stream(prompt, model=self.current_model):
-                # Mutate the last line in place to append streaming chunks
-                if idx < len(self.main_panel.state.lines):
-                    line_tuple = self.main_panel.state.lines[idx]
-                    if isinstance(line_tuple, tuple):
-                        existing_text, style = line_tuple
-                        self.main_panel.state.lines[idx] = (existing_text + chunk, style)
-                    else:
-                        # Rich Text object — append to it
-                        if hasattr(line_tuple, "append"):
-                            line_tuple.append(chunk)
+            # Preferred path: main agent with tools + delegation.
+            if self.orchestrator:
+                result = await self.orchestrator.chat(prompt, on_text_delta=append_chunk)
+                # If the agent produced output but streamed nothing, render it once.
+                if result and result.output and not self._active_text_raw.strip():
+                    append_chunk(result.output)
+                if result and not result.success and result.error:
+                    self.main_panel.add_error(f"Agent error: {result.error}")
                 self._dirty = True
+                return
+
+            # Fallback path: raw LLM stream (no tools).
+            messages = []
+            if self.system_prompt:
+                messages.append({"role": "system", "content": self.system_prompt})
+            messages.append({"role": "user", "content": prompt})
+
+            # Import TextDelta at runtime to avoid circular imports in TYPE_CHECKING
+            from harness.orchestration.llm_client import TextDelta
+
+            async for event in self.llm_client.stream(messages, model=self.current_model):
+                if isinstance(event, TextDelta):
+                    append_chunk(event.content)
         except Exception as e:
             self.main_panel.add_error(f"LLM error: {str(e)}")
             self._dirty = True

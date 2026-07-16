@@ -34,6 +34,30 @@ class Styles:
     AGENT_THINKING = Style(color="green", italic=True)
 
 
+# Block marker glyphs (Claude Code style). "C" replaces the round bullet as the
+# per-block leader; the corner joins a tool result under its call.
+BLOCK_MARKER = "C"
+RESULT_MARKER = "⎿"
+
+
+class BlockKind:
+    """Semantic block types with a leader color each (used by OutputRenderer)."""
+    ASSISTANT = "assistant"   # main LLM reply text
+    TOOL = "tool"             # tool call
+    AGENT = "agent"           # sub-agent spawn / status
+    SKILL = "skill"           # skill invocation
+    SYSTEM = "system"         # info/system line
+
+
+BLOCK_MARKER_COLORS = {
+    BlockKind.ASSISTANT: Colors.ACCENT_CORAL,
+    BlockKind.TOOL: Colors.ACCENT_CYAN,
+    BlockKind.AGENT: Colors.ACCENT_GOLD,
+    BlockKind.SKILL: Colors.ACCENT_GREEN,
+    BlockKind.SYSTEM: Colors.TEXT_DIM,
+}
+
+
 def create_console() -> Console:
     """Create Rich console with Claude Code styling."""
     import sys
