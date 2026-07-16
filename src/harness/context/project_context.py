@@ -55,7 +55,7 @@ def _load_memory(root: Path, settings) -> Tuple[str, list[Path]]:
 
     project_path = root / "HARNESS.md"
     if not project_path.exists():
-        project_path = root / "CLAUDE.md"
+        project_path = root / "**.md"
 
     if project_path.exists():
         try:
