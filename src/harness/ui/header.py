@@ -12,8 +12,8 @@ class Header:
         self.console = console
         self.branch = "main"
         self.version = "0.1.0"
-        self.path = r"C:\Users\Anupam\.local\bin\harness.exe"
-        self.command_context = "/agents"
+        self.path = "harness"
+        self.command_context = ""
 
     def update(self, branch: str = None, version: str = None, path: str = None, context: str = None) -> None:
         """Update header information."""
@@ -27,21 +27,29 @@ class Header:
             self.command_context = context
 
     def render_line1(self) -> Text:
-        """Render first header line: git branch + version + connection status."""
+        """Render first header line: project name + branch + version + status.
+
+        Clean, professional header with semantic colors:
+        - Project name & branch: blue (identity)
+        - Version: yellow/warning (metadata)
+        - Status: green (ready)
+        """
         line = Text()
-        line.append("Code on [", style=Styles.INFO)
-        line.append(self.branch, style="bold blue")
-        line.append("] is ", style=Styles.INFO)
-        line.append(f"v{self.version}", style=Styles.VERSION)
-        line.append(" via ", style=Styles.INFO)
-        line.append("⟲", style=Styles.INFO)
+        line.append("Agent Harness ", style="bold #58a6ff")
+        line.append("on ", style="dim")
+        line.append(self.branch, style="bold #58a6ff")
+        line.append(" · ", style="dim")
+        line.append(f"v{self.version}", style="dim #d29922")
+        line.append(" · ", style="dim")
+        line.append("ready", style="#3fb950")
         return line
 
     def render_line2(self) -> Text:
-        """Render second header line: system path + command context."""
+        """Render second header line: system path + command context (muted)."""
         line = Text()
-        line.append(self.path, style=Styles.PATH)
-        line.append(f"  {self.command_context}", style=Styles.INFO)
+        line.append(self.path, style="dim #6e7681")
+        if self.command_context:
+            line.append(f"  {self.command_context}", style="dim #6e7681")
         return line
 
     def render(self) -> Text:

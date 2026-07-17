@@ -36,7 +36,8 @@ class MainPanelState:
 
     def scroll_up(self, rows: int = 1) -> None:
         """Scroll up (toward older content)."""
-        self.scroll_position = min(self.scroll_position + rows, 10000)  # Cap at deque max
+        max_scroll = max(0, len(self.lines) - 1)
+        self.scroll_position = min(self.scroll_position + rows, max_scroll)
 
 
 class MainPanel:
@@ -46,10 +47,14 @@ class MainPanel:
         self.console = console
         self.state = MainPanelState(max_height=height)
 
-    def add_section(self, title: str, content: str, style: str = "") -> None:
-        """Add a titled section."""
+    def add_spacing(self) -> None:
+        """Add vertical breathing room between content blocks."""
         self.state.add_line("")
-        title_text = Text(title, style=Styles.WELCOME)
+
+    def add_section(self, title: str, content: str, style: str = "") -> None:
+        """Add a titled section with spacing."""
+        self.add_spacing()
+        title_text = Text(title, style=Styles.SECTION_TITLE)
         self.state.add_text(title_text)
         self.state.add_line(content, style)
 
@@ -62,15 +67,15 @@ class MainPanel:
         self.state.add_text(text)
 
     def add_success(self, text: str) -> None:
-        """Add success message."""
+        """Add success message (green)."""
         self.state.add_text(Text(text, style=Styles.SUCCESS))
 
     def add_error(self, text: str) -> None:
-        """Add error message."""
+        """Add error message (red)."""
         self.state.add_text(Text(text, style=Styles.ERROR))
 
     def add_info(self, text: str) -> None:
-        """Add info message."""
+        """Add info message (blue)."""
         self.state.add_text(Text(text, style=Styles.INFO))
 
     def clear(self) -> None:

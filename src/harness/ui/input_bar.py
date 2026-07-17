@@ -96,17 +96,28 @@ class InputBar:
         self.state.hint = "< for agents"
 
     def render(self):
-        """Render input bar with cursor."""
-        if self.state.in_palette_mode:
-            prefix = ": "
-            content = self.state.palette_buffer
-        else:
-            prefix = ") "
-            content = self.state.buffer
+        """Render input bar with semantic mode indicator and cursor.
 
-        # Simple output: just render the line with prompt, content, and cursor
-        line = f"{prefix}{content}█"
-        return Text(line, style="white on black")
+        Normal mode: purple prompt indicator + user input
+        Palette mode: blue command indicator + search input
+        Cursor always cyan for visual feedback.
+        """
+        result = Text()
+
+        if self.state.in_palette_mode:
+            # Command mode: blue indicator
+            result.append(":", style="bold #58a6ff")
+            result.append(" ", style="bold #58a6ff")
+            result.append(self.state.palette_buffer, style="#e6edf3")
+        else:
+            # Normal mode: purple prompt indicator
+            result.append("❯ ", style="bold #bc8ef7")
+            result.append(self.state.buffer, style="#e6edf3")
+
+        # Cursor (always cyan for visibility)
+        result.append("█", style="#79c0ff")
+
+        return result
 
     def get_current_input(self) -> str:
         """Get current input (either buffer or palette buffer)."""

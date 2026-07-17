@@ -29,7 +29,11 @@ class StatusBar:
         self.status_info = info
 
     def render(self) -> Text:
-        """Render status bar as Rich Text."""
+        """Render status bar with semantic status indicator and connection status.
+
+        Professional one-liner with icon, project metadata, and connection state.
+        Status colors: ready=green, executing=yellow, error=red, paused=dim.
+        """
         status_icons = {
             "ready": "✓",
             "executing": "⟳",
@@ -37,16 +41,27 @@ class StatusBar:
             "error": "⚠",
         }
 
-        change_marker = "[!?]" if self.status_info.has_changes else ""
+        status_colors = {
+            "ready": "#3fb950",      # green
+            "executing": "#d29922",  # yellow
+            "paused": "#6e7681",     # dim
+            "error": "#f85149",      # red
+        }
+
         status_icon = status_icons.get(self.status_info.status, "?")
+        status_color = status_colors.get(self.status_info.status, "#6e7681")
         connect_icon = "⟲" if self.status_info.connected else "✕"
+        connect_color = "#3fb950" if self.status_info.connected else "#f85149"
 
-        status_text = (
-            f"{self.status_info.project_name} ▸ {self.status_info.branch} "
-            f"{change_marker} is {status_icon} v{self.status_info.version} via {connect_icon}"
-        )
+        # One-line status bar: icon + status, then metadata right-aligned
+        result = Text()
+        result.append(f"{status_icon} {self.status_info.status} ", style=f"bold {status_color}")
+        result.append("· ", style="dim")
+        result.append(self.status_info.project_name, style="dim #6e7681")
+        result.append(" ", style="dim")
+        result.append(f"via {connect_icon}", style=f"dim {connect_color}")
 
-        return Text(status_text, style=Styles.STATUS_BAR, justify="right")
+        return result
 
     def display(self) -> None:
         """Print status bar to console."""

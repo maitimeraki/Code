@@ -21,7 +21,15 @@ class OutputRenderer:
 
     @staticmethod
     def _lead(kind: str) -> Text:
-        """Build the 'C ' block leader for a given block kind, colored per type."""
+        """Build the 'C ' block leader for a given block kind, colored per type.
+
+        Each block type has distinct color for semantic clarity:
+        - Assistant (coral): LLM responses
+        - Tool (cyan): Tool calls & execution
+        - Agent (gold): Agent spawning & status
+        - Skill (green): Skill invocation
+        - System (dim): Logs & metadata
+        """
         color = BLOCK_MARKER_COLORS.get(kind, BLOCK_MARKER_COLORS[BlockKind.SYSTEM])
         lead = Text()
         lead.append(f"{BLOCK_MARKER} ", style=f"bold {color}")
@@ -46,11 +54,12 @@ class OutputRenderer:
         """Wrap `body` as a tool result, joined under its call with '⎿'.
 
         Long results are truncated to keep the scrollback readable.
+        Errors use red, success uses muted text.
         """
         result = Text()
-        result.append(f"  {RESULT_MARKER} ", style=Styles.HINT)
+        result.append(f"  {RESULT_MARKER} ", style="dim" if not is_error else "bold #f85149")
         content = body if isinstance(body, str) else str(body)
-        style = Styles.ERROR if is_error else Styles.INPUT_TEXT
+        style = "bold #f85149" if is_error else "dim"  # Red for errors, muted for success
         truncated = content[:500]
         result.append(truncated, style=style)
         if len(content) > 500:
@@ -142,9 +151,10 @@ class OutputRenderer:
         """Render a compact one-line tool call: name(arg=val, …).
 
         Designed to sit under the 'C' block marker, so it carries no icon.
+        Tool name is bold cyan, params are muted for focus.
         """
         result = Text()
-        result.append(tool_name, style=Styles.TOOL_CALL)
+        result.append(tool_name, style="bold cyan")
         if params:
             try:
                 arg_str = ", ".join(f"{k}={json.dumps(v)}" for k, v in params.items())
@@ -152,9 +162,9 @@ class OutputRenderer:
                 arg_str = str(params)
             if len(arg_str) > 200:
                 arg_str = arg_str[:200] + "…"
-            result.append(f"({arg_str})", style=Styles.INPUT_TEXT)
+            result.append(f"({arg_str})", style="dim")
         else:
-            result.append("()", style=Styles.INPUT_TEXT)
+            result.append("()", style="dim")
         return result
 
     @staticmethod
@@ -187,7 +197,16 @@ class OutputRenderer:
 
     @staticmethod
     def render_agent_status(agent_name: str, status: str, detail: str = "") -> Text:
-        """Render agent status with icon and styling."""
+        """Render agent status with icon and semantic color styling.
+
+        Status indicators:
+        - SPAWNING/RUNNING: gold (action in progress)
+        - THINKING: gold (internal reasoning)
+        - TOOL_CALLING: cyan (external tool use)
+        - COMPLETED: green (success)
+        - FAILED: red (error)
+        - CANCELLED: dim (interrupted)
+        """
         status_icons = {
             "SPAWNING": "⚡",
             "RUNNING": "🔄",
@@ -200,13 +219,13 @@ class OutputRenderer:
         icon = status_icons.get(status, "→")
 
         status_styles = {
-            "SPAWNING": Styles.INFO,
-            "RUNNING": Styles.INFO,
-            "THINKING": Styles.AGENT_THINKING,
-            "TOOL_CALLING": Styles.TOOL_CALL,
-            "COMPLETED": Styles.SUCCESS,
-            "FAILED": Styles.ERROR,
-            "CANCELLED": Styles.HINT,
+            "SPAWNING": "bold #ffa657",      # gold
+            "RUNNING": "bold #ffa657",       # gold
+            "THINKING": "#ffa657",           # gold (not bold for subtle)
+            "TOOL_CALLING": "bold #79c0ff",  # cyan
+            "COMPLETED": "bold #3fb950",     # green
+            "FAILED": "bold #f85149",        # red
+            "CANCELLED": "dim",              # muted
         }
         style = status_styles.get(status, Styles.INPUT_TEXT)
 

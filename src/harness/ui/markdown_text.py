@@ -36,7 +36,7 @@ def _append_inline(text: Text, line: str) -> None:
         elif m.group("italic2") is not None:
             text.append(m.group("italic2"), style="italic")
         elif m.group("code") is not None:
-            text.append(m.group("code"), style=f"bold {Colors.ACCENT_CYAN}")
+            text.append(m.group("code"), style=f"bold {Colors.TOOL_CYAN}")
 
         pos = m.end()
 
@@ -71,13 +71,13 @@ def render_markdown(source: str) -> Text:
         heading = re.match(r"^(#{1,6})\s+(.*)$", stripped)
         if heading:
             text.append(indent)
-            _append_inline_styled(text, heading.group(2), base_style=f"bold {Colors.ACCENT_GOLD}")
+            _append_inline_styled(text, heading.group(2), base_style=f"bold {Colors.AGENT_GOLD}")
             continue
 
         # Bullets: - / * / + → normalized bullet glyph.
         bullet = re.match(r"^[-*+]\s+(.*)$", stripped)
         if bullet:
-            text.append(f"{indent}• ", style=Colors.ACCENT_CORAL)
+            text.append(f"{indent}• ", style=Colors.ASSISTANT_CORAL)
             _append_inline(text, bullet.group(1))
             continue
 

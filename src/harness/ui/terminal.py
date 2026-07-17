@@ -119,8 +119,12 @@ class TerminalUI:
                     self.main_panel.state.scroll_position = 0
                     self._dirty = True
 
-                    if text.startswith("/model"):
-                        self._handle_model_command(text)
+                    if text.startswith("/"):
+                        if text.startswith("/model"):
+                            self._handle_model_command(text)
+                        else:
+                            self.main_panel.add_error(f"Unknown command: {text}")
+                            self.main_panel.add_info("Available commands: /model [name]")
                     elif self.llm_client:
                         self.main_panel.add_info(f"You: {text}")
                         task = asyncio.create_task(self._handle_llm_prompt(text))
