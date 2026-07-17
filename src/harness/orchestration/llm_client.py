@@ -86,7 +86,6 @@ class LLMClient:
                     "extra_headers": {"Authorization": f"Bearer {self.settings.auth_token}"}
                     if self.settings.auth_token
                     else None,
-                    "timeout": 30,
                 }
                 # Only send tools/tool_choice when there are tools. Passing None
                 # trips some OpenAI-compatible endpoints (they echo nulls back).

@@ -46,7 +46,7 @@ class AgentConfig:
     task_description: str
     context: Dict[str, Any] = field(default_factory=dict)
     max_retries: int = 3
-    timeout_seconds: int = 300
+    timeout_seconds: int = 1800
     model: str = ""
     temperature: float = 0.7
     max_tokens: int = 4096
