@@ -119,7 +119,7 @@ class Settings(BaseSettings):
     execution_mode: str = Field(default="local", alias="EXECUTION_MODE")
     max_parallel_agents: int = Field(default=16, alias="MAX_PARALLEL_AGENTS")
     max_agent_retries: int = Field(default=3, alias="MAX_AGENT_RETRIES")
-    tool_timeout_seconds: int = Field(default=30, alias="TOOL_TIMEOUT_SECONDS")
+    tool_timeout_seconds: int = Field(default=1800, alias="TOOL_TIMEOUT_SECONDS")
 
     # Performance
     prompt_cache_size_mb: int = Field(default=500, alias="PROMPT_CACHE_SIZE_MB")
