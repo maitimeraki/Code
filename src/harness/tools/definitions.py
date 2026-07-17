@@ -28,7 +28,7 @@ class EditFileArgs(BaseModel):
 class BashExecArgs(BaseModel):
     """Arguments for bash_exec tool."""
     command: str
-    timeout: int = 30
+    timeout: int = 300
 
 
 class GrepSearchArgs(BaseModel):

@@ -57,7 +57,7 @@ async def edit_file(path: str, old_text: str, new_text: str) -> str:
         raise
 
 
-async def bash_exec(command: str, timeout: int = 30) -> str:
+async def bash_exec(command: str, timeout: int = 300) -> str:
     """Execute bash command."""
     try:
         proc = await asyncio.create_subprocess_shell(
