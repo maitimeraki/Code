@@ -12,6 +12,7 @@ class TaskStatus(str, Enum):
     PENDING = "pending"
     RUNNING = "running"
     PAUSED = "paused"
+    WAITING_APPROVAL = "waiting_approval"  # Phase 3: HITL gate
     COMPLETED = "completed"
     FAILED = "failed"
 
@@ -23,6 +24,8 @@ class ExitCondition(str, Enum):
     CRITICAL_ERROR = "critical_error"
     TOKEN_BUDGET = "token_budget"
     USER_CANCEL = "user_cancel"
+    NO_PROGRESS = "no_progress"  # distinct errors each turn, but never advancing
+    WALL_CLOCK = "wall_clock"    # exceeded max_wall_seconds
 
 
 @dataclass
@@ -34,6 +37,7 @@ class TaskState:
 
     iteration: int = 0
     max_iterations: int = 10
+    max_wall_seconds: int = 0  # 0 = no wall-clock cap
 
     # Execution results
     results: dict[str, Any] = field(default_factory=dict)
@@ -51,6 +55,13 @@ class TaskState:
 
     # Exit reason
     exit_condition: Optional[ExitCondition] = None
+
+    # Phase 1: Missing fields for DB alignment & HITL
+    tokens_used: int = 0
+    result: Optional[str] = None  # Final task result
+    error: Optional[str] = None   # Final error (if failed)
+    waiting_on: Optional[str] = None  # HITL: approval gate ID (Phase 3)
+    cursor: int = 0  # Tool call index for resumption
 
     def is_complete(self) -> bool:
         """Check if all success criteria are met."""
