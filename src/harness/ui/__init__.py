@@ -21,6 +21,7 @@ from .stream_aggregator import StreamAggregator
 # Phase 2D - Agent State Display
 from .agent_view import AgentView, Agent, AgentStatus
 from .tool_view import ToolView, ToolCall, ToolStatus
+from .agent_activity import AgentActivityTracker, AgentActivity
 
 # Phase 2E - Command Actions
 from .command_actions import CommandActions
@@ -41,6 +42,7 @@ __all__ = [
     # Phase 2D
     "AgentView", "Agent", "AgentStatus",
     "ToolView", "ToolCall", "ToolStatus",
+    "AgentActivityTracker", "AgentActivity",
     # Phase 2E
     "CommandActions",
 ]

@@ -20,10 +20,23 @@ from .command_actions import CommandActions
 from .stream_listener import StreamListener, LogEntry
 from .stream_aggregator import StreamAggregator
 from .renderers import OutputRenderer
-from .claude_code_style import BlockKind
+from .claude_code_style import BlockKind, Colors
 
 if TYPE_CHECKING:
     from harness.orchestration.llm_client import LLMClient, TextDelta
+
+
+# Per-agent inline gutter: a distinct (glyph, color) pair is assigned to each
+# concurrent sub-agent by arrival order, so their interleaved lines in the shared
+# main body remain visually separable. Cycles if more agents than pairs appear.
+_SUBAGENT_GUTTERS = [
+    ("┃", Colors.AGENT_GOLD),
+    ("┋", Colors.ACCENT_PURPLE),
+    ("┇", Colors.TOOL_CYAN),
+    ("╏", Colors.ACCENT_BLUE),
+    ("┊", Colors.SUCCESS_GREEN),
+    ("╎", Colors.WARNING_YELLOW),
+]
 
 
 class TerminalUI:
@@ -65,6 +78,15 @@ class TerminalUI:
         # Phase 2C: Real-time streams
         self.stream_listener = StreamListener()
         self.stream_aggregator = StreamAggregator(self.stream_listener)
+
+        # Parallel sub-agent activity: instead of a separate region, each concurrent
+        # delegated agent occupies ONE in-place card line in the main orchestrator
+        # body. The card updates in place as events arrive — showing status, a running
+        # tool-call count, and the most-recent tool — so 20 tool calls don't produce
+        # 20 lines. Keyed by agent_id; each holds its gutter + live state + the
+        # scrollback index of its card line.
+        self._subagents: dict = {}
+        self._next_subagent_gutter = 0
 
         # Phase 2E: Command actions
         self.command_actions = CommandActions(self)
@@ -197,11 +219,27 @@ class TerminalUI:
         async def on_batch(entries: list[LogEntry]):
             """Handle a batch of log entries with type-aware rendering.
 
+            Events are split by depth. Sub-agent events (depth >= 1, produced by
+            delegated parallel agents) are rendered inline into the main scrollback
+            with a per-agent colored gutter, so concurrent agents stay visually
+            distinct while sharing the orchestrator's body. Orchestrator-level
+            events (depth 0) render into the main panel as before.
+
             Each tool/agent/skill event is wrapped with its block marker and
             closes any active assistant text block, so the next streamed reply
             text opens a fresh block *below* the event (chronological order).
             """
             for entry in entries:
+                data = entry.data or {}
+                depth = data.get("depth", 0) or 0
+
+                # ---- Sub-agent lane: render inline with a per-agent gutter ----
+                if depth >= 1 and entry.source in ("tool", "agent_status", "agent"):
+                    self._route_subagent_event(entry, data)
+                    self._dirty = True
+                    continue
+
+                # ---- Orchestrator lane: existing main-pipeline rendering ----
                 # Route to specialized renderer based on entry source and data
                 if entry.source == "tool" and entry.data:
                     if entry.data.get("result") is None and entry.data.get("error") is None:
@@ -287,7 +325,12 @@ class TerminalUI:
         self._dirty = False  # Start clean - CompatibleLive prints initial layout
 
     def render_layout(self) -> Layout:
-        """Create responsive layout: header + main + input (pinned) + status (pinned)."""
+        """Create responsive layout: header + main + input + status.
+
+        Parallel sub-agents are streamed inline into the main panel (each with its
+        own colored gutter), so there is no separate sub-agent region — the main
+        body always fills all space between header and input bar.
+        """
         layout = Layout()
         width = self.console.width if self.console.width else 120
         height = self.console.height if self.console.height else 40
@@ -301,7 +344,6 @@ class TerminalUI:
         total_fixed = header_height + input_height + status_height
         main_height = max(10, height - total_fixed)
 
-        # Fixed 4-region layout: header / main (flex) / input (pinned) / status (pinned)
         layout.split_column(
             Layout(name="header", size=header_height),
             Layout(name="main", size=main_height),
@@ -460,6 +502,97 @@ class TerminalUI:
             else:
                 self.main_panel.add_error(f"Model '{model_name}' not found. Available: {', '.join(self.llm_client.settings.models)}")
         self._dirty = True
+
+    def _ensure_subagent(self, agent_id: str, name: str) -> dict:
+        """Return the live card state for a sub-agent, creating its card line on first sight.
+
+        On creation, a stable (glyph, color) gutter is assigned and a fresh card
+        line is appended to the main body; its scrollback index is stored so later
+        events can re-render that same line in place instead of appending new ones.
+        """
+        state = self._subagents.get(agent_id)
+        if state is not None:
+            return state
+
+        glyph, color = _SUBAGENT_GUTTERS[self._next_subagent_gutter % len(_SUBAGENT_GUTTERS)]
+        self._next_subagent_gutter += 1
+        state = {
+            "name": name,
+            "glyph": glyph,
+            "color": color,
+            "status": "RUNNING",
+            "tool_count": 0,
+            "current_tool": "",
+            "detail": "",
+            "line_idx": None,
+        }
+        self._subagents[agent_id] = state
+
+        # Append this agent's card line and remember where it lives.
+        self.main_panel.add_text(self._render_subagent_card(state))
+        state["line_idx"] = len(self.main_panel.state.lines) - 1
+        # A sub-agent card closes any active assistant text block so reply text
+        # opens fresh below the cards (chronology preserved).
+        self._active_text_idx = None
+        self._active_text_raw = ""
+        return state
+
+    def _render_subagent_card(self, state: dict):
+        """Build the Rich Text for a sub-agent's card from its current state."""
+        return OutputRenderer.render_subagent_card(
+            glyph=state["glyph"],
+            gutter_color=state["color"],
+            agent_name=state["name"],
+            status=state["status"],
+            tool_count=state["tool_count"],
+            current_tool=state["current_tool"],
+            detail=state["detail"],
+        )
+
+    def _refresh_subagent_card(self, state: dict) -> None:
+        """Re-render a sub-agent's card line in place (no new scrollback line)."""
+        idx = state.get("line_idx")
+        if idx is not None and idx < len(self.main_panel.state.lines):
+            self.main_panel.state.lines[idx] = self._render_subagent_card(state)
+        else:
+            # Card line was scrolled out of the bounded deque; re-append.
+            self.main_panel.add_text(self._render_subagent_card(state))
+            state["line_idx"] = len(self.main_panel.state.lines) - 1
+
+    def _route_subagent_event(self, entry: LogEntry, data: dict) -> None:
+        """Update a depth>=1 sub-agent's in-place card in the main orchestrator body.
+
+        Each concurrent sub-agent owns exactly one card line, updated in place as
+        events arrive: a tool call bumps the running count and becomes the card's
+        "most-recent tool"; a status change updates the card's status. This keeps
+        each agent's activity in its own space and collapses many tool calls into a
+        count + latest call, rather than one line per call.
+        """
+        agent_id = data.get("agent_id") or data.get("agent") or "sub-agent"
+        name = data.get("agent") or "sub-agent"
+        state = self._ensure_subagent(agent_id, name)
+
+        if entry.source == "agent_status":
+            state["status"] = data.get("status", state["status"])
+            detail = data.get("detail") or ""
+            if detail:
+                state["detail"] = detail
+        elif entry.source == "tool":
+            is_result = data.get("result") is not None or data.get("error") is not None
+            if is_result:
+                # A result only confirms the in-flight call finished; don't count it.
+                return
+            state["tool_count"] += 1
+            state["status"] = "TOOL_CALLING"
+            state["current_tool"] = OutputRenderer.format_tool_compact(
+                data.get("tool", "unknown"),
+                data.get("args") or {},
+            )
+        else:
+            # source == "agent" (streamed sub-agent prose) is intentionally dropped.
+            return
+
+        self._refresh_subagent_card(state)
 
     def _wrap_block(self, kind: str, inner):
         """Wrap a Channel-B event render with its 'C' block marker.

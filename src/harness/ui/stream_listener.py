@@ -59,8 +59,12 @@ class StreamListener:
         message: str,
         level: LogLevel = LogLevel.INFO,
         data: Optional[dict] = None,
+        agent: Optional[str] = None,
+        agent_id: Optional[str] = None,
+        depth: int = 0,
     ) -> None:
         """Log agent output."""
+        data = {**(data or {}), "agent": agent, "agent_id": agent_id, "depth": depth}
         entry = LogEntry(
             timestamp=datetime.now(),
             level=level,
@@ -76,11 +80,26 @@ class StreamListener:
         args: dict,
         result: Optional[str] = None,
         error: Optional[str] = None,
+        agent: Optional[str] = None,
+        agent_id: Optional[str] = None,
+        depth: int = 0,
     ) -> None:
-        """Log a tool call."""
+        """Log a tool call.
+
+        agent/agent_id/depth attribute the call to the (possibly parallel)
+        sub-agent that issued it, so the UI can separate concurrent agents.
+        """
         message = f"Tool: {tool_name}"
         level = LogLevel.ERROR if error else LogLevel.INFO
-        data = {"tool": tool_name, "args": args, "result": result, "error": error}
+        data = {
+            "tool": tool_name,
+            "args": args,
+            "result": result,
+            "error": error,
+            "agent": agent,
+            "agent_id": agent_id,
+            "depth": depth,
+        }
         entry = LogEntry(
             timestamp=datetime.now(),
             level=level,
@@ -130,10 +149,18 @@ class StreamListener:
         agent_name: str,
         status: str,
         detail: Optional[str] = None,
+        agent_id: Optional[str] = None,
+        depth: int = 0,
     ) -> None:
         """Log agent status change."""
         message = f"Agent {agent_name}: {status}"
-        data = {"agent": agent_name, "status": status, "detail": detail}
+        data = {
+            "agent": agent_name,
+            "status": status,
+            "detail": detail,
+            "agent_id": agent_id,
+            "depth": depth,
+        }
         entry = LogEntry(
             timestamp=datetime.now(),
             level=LogLevel.INFO,

@@ -238,6 +238,87 @@ class OutputRenderer:
         return result
 
     @staticmethod
+    def format_tool_compact(tool_name: str, args: Optional[dict] = None, max_val: int = 32) -> Text:
+        """Compact one-line tool render for a sub-agent card: name(key=val).
+
+        Shows only the single most-informative argument, tightly truncated, so the
+        card stays on one line regardless of how many args the tool received.
+        """
+        result = Text()
+        result.append(tool_name, style="bold cyan")
+        if not args:
+            result.append("()", style="dim")
+            return result
+        chosen_key = None
+        for key in ("path", "pattern", "command", "name", "query", "url"):
+            if key in args and args[key]:
+                chosen_key = key
+                break
+        if chosen_key is None:
+            chosen_key = next(iter(args))
+        val = str(args[chosen_key])
+        if len(val) > max_val:
+            val = val[:max_val] + "…"
+        result.append(f"({chosen_key}={val})", style="dim")
+        return result
+
+    @staticmethod
+    def render_subagent_card(
+        glyph: str,
+        gutter_color: str,
+        agent_name: str,
+        status: str,
+        tool_count: int,
+        current_tool: Union[Text, str, None] = None,
+        detail: str = "",
+        name_width: int = 12,
+    ) -> Text:
+        """Render one sub-agent's in-place card line for the shared main body.
+
+        A single line per agent that is re-rendered in place as events arrive, so
+        20 tool calls collapse to a running count plus the most-recent call rather
+        than 20 separate lines. Layout:
+
+            <glyph> <name>  <status> · N tools · → <recent tool>
+
+        The gutter glyph+color is stable per agent so concurrent agents' cards stay
+        visually distinct within the orchestrator body.
+        """
+        status_styles = {
+            "SPAWNING": ("⚡", "bold #ffa657"),
+            "RUNNING": ("🔄", "bold #ffa657"),
+            "THINKING": ("🧠", "#ffa657"),
+            "TOOL_CALLING": ("⚙", "bold #79c0ff"),
+            "COMPLETED": ("✓", "bold #3fb950"),
+            "FAILED": ("✗", "bold #f85149"),
+            "CANCELLED": ("⊘", "dim"),
+        }
+        icon, status_style = status_styles.get(status, ("→", Styles.INPUT_TEXT))
+
+        result = Text()
+        result.append(f"{glyph} ", style=f"bold {gutter_color}")
+        result.append(f"{agent_name[:name_width]:<{name_width}} ", style=f"bold {gutter_color}")
+        result.append(f"{icon} ", style=status_style)
+        result.append(status.lower(), style=status_style)
+
+        result.append(f" · {tool_count} tool{'s' if tool_count != 1 else ''}", style=Styles.HINT)
+
+        is_terminal = status in ("COMPLETED", "FAILED", "CANCELLED")
+        if not is_terminal:
+            result.append("  → ", style="bold #79c0ff")
+            if current_tool is not None and (not isinstance(current_tool, str) or current_tool):
+                result.append(current_tool if isinstance(current_tool, Text) else Text(str(current_tool)))
+            else:
+                result.append("thinking…", style=Styles.AGENT_THINKING)
+
+        # Task detail is only shown before the agent starts calling tools; once
+        # tools flow, the recent-tool tail carries the signal and detail would
+        # push the card past one line.
+        if detail and tool_count == 0:
+            result.append(f"   {detail[:50]}", style=Styles.HINT)
+        return result
+
+    @staticmethod
     def render_skill_call(skill_name: str, params: Optional[dict] = None) -> Text:
         """Render skill invocation with parameters."""
         result = Text()
