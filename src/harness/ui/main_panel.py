@@ -16,6 +16,11 @@ class MainPanelState:
     scroll_position: int = 0
     title: str = "Agent Harness"
     max_height: Optional[int] = None
+    # Highest valid scroll offset (in rendered rows), recomputed by render() each
+    # frame once the top of the buffer is reached. scroll_up() clamps against this
+    # instead of the logical entry count — a single entry can wrap to many rows,
+    # so an entry-count cap would stop scrolling far short of the real top.
+    max_scroll: int = 0
 
     def add_line(self, text: str, style: str = "") -> None:
         """Add a line to panel content."""
@@ -29,15 +34,20 @@ class MainPanelState:
         """Clear all content."""
         self.lines.clear()
         self.scroll_position = 0
+        self.max_scroll = 0
 
     def scroll_down(self, rows: int = 1) -> None:
         """Scroll down (toward newer content)."""
         self.scroll_position = max(0, self.scroll_position - rows)
 
     def scroll_up(self, rows: int = 1) -> None:
-        """Scroll up (toward older content)."""
-        max_scroll = max(0, len(self.lines) - 1)
-        self.scroll_position = min(self.scroll_position + rows, max_scroll)
+        """Scroll up (toward older content).
+
+        Offset is measured in rendered rows. render() clamps the value to the true
+        row-based maximum (state.max_scroll) once the top is reached, so an
+        optimistic increment here can never scroll past the first line.
+        """
+        self.scroll_position += rows
 
 
 class MainPanel:
@@ -99,9 +109,13 @@ class MainPanel:
         row_chunks = []
         rows_needed = available_height + self.state.scroll_position
         rows_seen = 0
+        exhausted = True  # becomes False if we stop before consuming every entry
 
         for entry in reversed(list(self.state.lines)):
             if rows_seen >= rows_needed:
+                # Stopped early: there is still older content above the window,
+                # so the user can scroll further than the current offset.
+                exhausted = False
                 break
 
             # Convert (text, style) tuple or Text object to a Text object
@@ -119,6 +133,18 @@ class MainPanel:
         # Reverse chunk order to chronological (oldest-first), preserving internal row order per chunk
         row_chunks.reverse()
         visible_rows = [row for chunk in row_chunks for row in chunk]
+
+        # Establish the true row-based scroll ceiling. Only when the walk reached
+        # the top of the buffer (exhausted) do we know the total row count, and
+        # can clamp scroll_position so it never overshoots the first line. While
+        # more content remains above (not exhausted), allow scrolling further.
+        if exhausted:
+            self.state.max_scroll = max(0, len(visible_rows) - available_height)
+            if self.state.scroll_position > self.state.max_scroll:
+                self.state.scroll_position = self.state.max_scroll
+        else:
+            self.state.max_scroll = self.state.scroll_position + available_height
+
         start_row = max(0, len(visible_rows) - available_height - self.state.scroll_position)
         end_row = start_row + available_height
         displayed_rows = visible_rows[start_row:end_row]
