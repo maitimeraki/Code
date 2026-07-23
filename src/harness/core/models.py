@@ -36,7 +36,7 @@ class TaskState:
     status: TaskStatus = TaskStatus.PENDING
 
     iteration: int = 0
-    max_iterations: int = 10
+    max_iterations: int = 50
     max_wall_seconds: int = 0  # 0 = no wall-clock cap
 
     # Execution results

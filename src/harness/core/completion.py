@@ -50,12 +50,15 @@ class CompletionChecker:
         validators = {}
 
         for key, expected in criteria_dict.items():
-            if isinstance(expected, (int, float)):
+            # bool must be checked before int/float: in Python bool is a subclass
+            # of int, so isinstance(True, (int, float)) is True and would otherwise
+            # route boolean criteria into the numeric >= comparison.
+            if isinstance(expected, bool):
+                validators[key] = lambda result, exp=expected: result is exp
+            elif isinstance(expected, (int, float)):
                 validators[key] = lambda result, exp=expected: (
                     isinstance(result, (int, float)) and result >= exp
                 )
-            elif isinstance(expected, bool):
-                validators[key] = lambda result, exp=expected: result is exp
             else:
                 validators[key] = lambda result, exp=expected: result == exp
 
