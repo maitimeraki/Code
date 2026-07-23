@@ -143,12 +143,14 @@ class AgentSpawner:
         tool_timeout_seconds: Optional[int] = None,
         stream_listener: Optional["StreamListener"] = None,
         approval_callback: Optional[Callable] = None,
+        ask_user_question_callback: Optional[Callable] = None,
     ):
         self.llm_client = llm_client or LLMClient()
         self.max_parallel_agents = max_parallel_agents or get_settings().max_parallel_agents
         self.tool_timeout_seconds = tool_timeout_seconds or get_settings().tool_timeout_seconds
         self.stream_listener = stream_listener
         self.approval_callback = approval_callback
+        self.ask_user_question_callback = ask_user_question_callback
         self.results = {}
 
     async def spawn(
@@ -211,6 +213,7 @@ class AgentSpawner:
                 agent_registry=config.agent_registry,
                 spawn_fn=self.spawn,
                 parent_config=config,
+                ask_user_question_callback=self.ask_user_question_callback,
             )
             executor = ToolExecutor(
                 router,
@@ -512,7 +515,7 @@ class AgentSpawner:
         """
         tool_error = None
         tool_result = None
-        tokens = 0
+        tokens = 0  # track token cost for this call
 
         # Emit tool call start event
         if self.stream_listener:
@@ -567,6 +570,7 @@ class AgentSpawner:
                 args={},  # Already logged in call start
                 result=tool_result.tool_call.result if tool_result else None,
                 error=tool_error,
+                tokens=tokens,
                 agent=agent_name,
                 agent_id=agent_id,
                 depth=depth,

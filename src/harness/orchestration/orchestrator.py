@@ -52,6 +52,7 @@ class HarnessOrchestrator:
             tool_timeout_seconds=settings.tool_timeout_seconds,
             stream_listener=self.stream_listener,
             approval_callback=ui.request_approval if ui else None,
+            ask_user_question_callback=ui.ask_user_question_callback if ui else None,
         )
 
     def compose_capsule(self, agent_result) -> dict:
