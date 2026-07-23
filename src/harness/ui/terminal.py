@@ -1,7 +1,11 @@
 """Main terminal orchestrator for Claude Code-style UI."""
 
 import asyncio
+import json
 import signal
+import time
+from collections import OrderedDict
+from datetime import datetime, timedelta
 from typing import Optional, TYPE_CHECKING
 from rich.layout import Layout
 from rich.live import Live
@@ -13,7 +17,7 @@ from .input_bar import InputBar
 from .header import Header
 from .welcome_panel import WelcomePanel
 from .state import UIState
-from .keybinds import KeybindMap
+from .keybinds import KeybindMap, KeyCode
 from .input_handler import InputHandler, KeyEvent
 from .command_palette import CommandPalette
 from .command_actions import CommandActions
@@ -69,6 +73,12 @@ class TerminalUI:
         # text/tool/text output in true chronological order.
         self._active_text_idx: Optional[int] = None
         self._active_text_raw: str = ""
+        # Set when new tokens have been appended to _active_text_raw but the
+        # rendered block has not yet been rebuilt. The markdown re-render is O(n)
+        # in the reply length, so rebuilding per token is O(n²) and causes the
+        # streaming stutter. Instead we coalesce: append is cheap, and the block
+        # is rebuilt at most once per display frame (see _flush_active_text).
+        self._text_dirty: bool = False
 
         # Phase 2B: Keyboard input
         self.keybinds = KeybindMap()
@@ -88,9 +98,43 @@ class TerminalUI:
         self._subagents: dict = {}
         self._next_subagent_gutter = 0
 
+        # Main orchestrator's own tool activity is collapsed the same way sub-agent
+        # activity is: ONE in-place card line showing status, a running tool-call
+        # count, the most-recent call, and up to two lines of that call's output —
+        # instead of a full call block + full output block per call (the flood).
+        # None until the orchestrator issues its first tool call in a turn; reset
+        # to None whenever assistant prose resumes so the next tool burst opens a
+        # fresh card below that prose (chronological order preserved).
+        self._orch_card: Optional[dict] = None
+
         # Phase 2E: Command actions
         self.command_actions = CommandActions(self)
         self._wire_command_handlers()
+
+        # Inline approval: pending approval dict + lock for serial prompts
+        self._pending_approval: Optional[dict] = None  # {tool, args, risk, future}
+        self._approval_lock = asyncio.Lock()
+
+        # Pending question interactive picker
+        self._pending_question: Optional[dict] = None
+        self._question_lock = asyncio.Lock()
+
+        # Task board: OrderedDict of task_id -> TaskItem dicts
+        self._task_board: OrderedDict = OrderedDict()
+        self._task_board_goal: str = ""
+        self._task_board_dirty: bool = False
+        self._all_done_at: Optional[datetime] = None
+
+        # Processing indicator
+        self._is_processing: bool = False
+        self._show_indicator: bool = True
+        self._spinner_frame: int = 0
+
+        # Token tracking (accumulated from stream tool events)
+        self._total_tokens_used: int = 0
+
+        # Task board blinking cursor toggle
+        self._task_blink_on: bool = True
 
     def _wire_command_handlers(self) -> None:
         """Wire command actions to palette commands."""
@@ -109,6 +153,280 @@ class TerminalUI:
         for cmd in self.command_palette.commands:
             if cmd.shortcut in handler_map:
                 cmd.handler = handler_map[cmd.shortcut]
+
+    async def request_approval(self, tool_type, args: dict, risk: str) -> bool:
+        """Request user approval for high-risk tool call. Await user y/n keypress.
+
+        Returns: True if approved, False if denied.
+        ponytail: serial approval (one at a time via lock), fine for human-paced input.
+        """
+        async with self._approval_lock:
+            # Create future for y/n response
+            future: asyncio.Future[bool] = asyncio.Future()
+
+            # Store pending approval state
+            self._pending_approval = {
+                "tool": tool_type.value if hasattr(tool_type, "value") else str(tool_type),
+                "args": args,
+                "risk": risk,
+                "future": future,
+            }
+            self._dirty = True
+
+            # Await the y/n keypress to resolve the future
+            try:
+                result = await asyncio.wait_for(future, timeout=30)  # 30s timeout
+            except asyncio.TimeoutError:
+                result = False  # Timeout → deny
+            finally:
+                self._pending_approval = None
+                self._dirty = True
+
+            return result
+
+    # ── AskUserQuestion interactive picker ─────────────────────────────────
+
+    @property
+    def ask_user_question_callback(self):
+        """Return the handle_ask_user_question coroutine for tool-router wiring.
+
+        The factory passes this as the interactive AskUserQuestion handler so the
+        tool call shows a picker card instead of a static JSON stub.
+        """
+        return self.handle_ask_user_question
+
+    async def handle_ask_user_question(
+        self, questions: Optional[list] = None, multi_select: bool = False,
+        preview: Optional[dict] = None,
+    ) -> str:
+        """Handle AskUserQuestion: show picker card, await answer, return JSON.
+
+        Blocks until the user answers or timeout fires. The picker card replaces
+        the input bar during this time. Returns a JSON string with answers.
+        """
+        async with self._question_lock:
+            q = questions[0] if questions else {"question": "No question provided", "options": []}
+            options = q.get("options", [])
+
+            from harness.config import get_settings
+            timeout_seconds = get_settings().ask_question_timeout_seconds
+            future: asyncio.Future = asyncio.Future()
+
+            state = {
+                "question": q.get("question", ""),
+                "header": q.get("header", ""),
+                "options": options,
+                "multi_select": multi_select,
+                "focus_index": 0,
+                "selections": set(),
+                "mode": "options",
+                "other_buffer": "",
+                "answers": {},
+                "annotations": {},
+                "future": future,
+                "timeout_seconds": timeout_seconds,
+                "timeout_at": (
+                    datetime.now() + timedelta(seconds=timeout_seconds)
+                    if timeout_seconds > 0 else None
+                ),
+            }
+            self._pending_question = state
+            self._dirty = True
+
+            question_text = state["question"]
+            try:
+                if timeout_seconds > 0:
+                    result = await asyncio.wait_for(future, timeout=timeout_seconds)
+                else:
+                    result = await future
+            except asyncio.TimeoutError:
+                result = {"answers": {}, "annotations": {"note": "User away, auto-continued"}}
+            finally:
+                self._pending_question = None
+                self._dirty = True
+
+            # Render confirmation in scrollback
+            answer_str = json.dumps(result.get("answers", {}))
+            self.main_panel.add_text(
+                OutputRenderer.render_question_confirmation(question_text, answer_str)
+            )
+            self._dirty = True
+
+            return json.dumps(result)
+
+    # ── Picker key handlers ────────────────────────────────────────────────
+
+    async def _handle_picker_key(self, key: str) -> bool:
+        """Route a key event to the picker action. Returns True if consumed."""
+        state = self._pending_question
+        if not state:
+            return False
+
+        if state["mode"] == "options":
+            if key in "123456789":
+                idx = int(key) - 1
+                if 0 <= idx < len(state["options"]):
+                    return await self._picker_select(idx)
+            if key in (KeyCode.UP.value, "k"):
+                return await self._picker_nav(-1)
+            if key in (KeyCode.DOWN.value, "j"):
+                return await self._picker_nav(1)
+            if key in (KeyCode.ENTER.value, "\r", "\n"):
+                return await self._picker_confirm()
+            if key in ("\t", "o", "O"):
+                return await self._picker_other_mode()
+            if key == " " and state.get("multi_select"):
+                return await self._picker_toggle()
+            if key in (KeyCode.ESCAPE.value, "\x1b"):
+                return await self._picker_cancel()
+        else:
+            # Other text-input mode
+            if key in (KeyCode.ENTER.value, "\r", "\n"):
+                return await self._picker_confirm_other()
+            if key in (KeyCode.ESCAPE.value, "\x1b"):
+                state["mode"] = "options"
+                self._dirty = True
+                return True
+            if key in (KeyCode.BACKSPACE.value, "\x7f"):
+                state["other_buffer"] = state["other_buffer"][:-1]
+                self._dirty = True
+                return True
+            if key and len(key) == 1 and key.isprintable():
+                state["other_buffer"] += key
+                self._dirty = True
+                return True
+
+        return False
+
+    async def _picker_nav(self, direction: int) -> bool:
+        state = self._pending_question
+        opts = state["options"]
+        if not opts:
+            return True
+        state["focus_index"] = (state["focus_index"] + direction) % len(opts)
+        self._dirty = True
+        return True
+
+    async def _picker_select(self, idx: int) -> bool:
+        state = self._pending_question
+        if not state.get("multi_select"):
+            state["answers"] = state["options"][idx].get("label", "")
+            if state["future"] and not state["future"].done():
+                state["future"].set_result({"answers": state["answers"]})
+            return True
+        if idx in state["selections"]:
+            state["selections"].discard(idx)
+        else:
+            state["selections"].add(idx)
+        state["focus_index"] = idx
+        self._dirty = True
+        return True
+
+    async def _picker_toggle(self) -> bool:
+        state = self._pending_question
+        idx = state["focus_index"]
+        if idx in state["selections"]:
+            state["selections"].discard(idx)
+        else:
+            state["selections"].add(idx)
+        self._dirty = True
+        return True
+
+    async def _picker_confirm(self) -> bool:
+        state = self._pending_question
+        if state.get("multi_select"):
+            selected = [state["options"][i] for i in state["selections"]]
+            state["answers"] = [s.get("label", "") for s in selected]
+        else:
+            idx = state["focus_index"]
+            if 0 <= idx < len(state["options"]):
+                state["answers"] = state["options"][idx].get("label", "")
+            else:
+                state["answers"] = ""
+        if state["future"] and not state["future"].done():
+            state["future"].set_result({"answers": state["answers"]})
+        return True
+
+    async def _picker_other_mode(self) -> bool:
+        state = self._pending_question
+        state["mode"] = "other"
+        state["other_buffer"] = ""
+        self._dirty = True
+        return True
+
+    async def _picker_confirm_other(self) -> bool:
+        state = self._pending_question
+        state["answers"] = state.get("other_buffer", "").strip()
+        if state["future"] and not state["future"].done():
+            state["future"].set_result({"answers": state["answers"]})
+        return True
+
+    async def _picker_cancel(self) -> bool:
+        state = self._pending_question
+        state["answers"] = {}
+        if state["future"] and not state["future"].done():
+            state["future"].set_result({"answers": {}, "cancelled": True})
+        return True
+
+    # ── Task board helpers ─────────────────────────────────────────────────
+
+    def _ensure_task_board(self, tasks: Optional[list] = None) -> None:
+        """Initialize task board from a list of task dicts."""
+        if not tasks:
+            return
+        for t in tasks:
+            tid = t.get("id", t.get("task_id", ""))
+            if tid and tid not in self._task_board:
+                self._task_board[tid] = dict(t)
+                self._task_board[tid]["blocked_by"] = set(t.get("blocked_by", []))
+        self._task_board_dirty = True
+        self._dirty = True
+
+    def _update_task(self, task_data: dict) -> None:
+        """Update a task in the board from a TaskUpdate event."""
+        tid = task_data.get("task_id", "")
+        if not tid:
+            return
+        if tid not in self._task_board:
+            self._task_board[tid] = {
+                "id": tid,
+                "subject": task_data.get("subject", "Untitled"),
+                "status": task_data.get("status", "pending"),
+                "owner": task_data.get("owner"),
+                "blocked_by": set(task_data.get("blocked_by", [])),
+                "active_form": task_data.get("active_form", ""),
+            }
+        else:
+            self._task_board[tid].update(task_data)
+            if "blocked_by" in task_data:
+                self._task_board[tid]["blocked_by"] = set(task_data["blocked_by"])
+
+        status = task_data.get("status", "")
+        if status == "completed":
+            self._task_board[tid]["completed_at"] = datetime.now()
+
+        self._task_board_dirty = True
+        self._dirty = True
+
+        # Check if all tasks completed → start 2s fade timer
+        if self._task_board and all(
+            t.get("status") == "completed" for t in self._task_board.values()
+        ):
+            self._all_done_at = datetime.now()
+
+    def _age_completed_tasks(self) -> None:
+        """Collapse the task board 2 seconds after all tasks complete."""
+        if self._all_done_at is None:
+            return
+        if not self._task_board:
+            self._all_done_at = None
+            return
+        elapsed = (datetime.now() - self._all_done_at).total_seconds()
+        if elapsed >= 2.0:
+            self._task_board.clear()
+            self._all_done_at = None
+            self._task_board_dirty = True
+            self._dirty = True
 
     def _setup_signal_handlers(self) -> None:
         """Setup terminal signal handlers."""
@@ -233,6 +551,33 @@ class TerminalUI:
                 data = entry.data or {}
                 depth = data.get("depth", 0) or 0
 
+                # ── Side effects: token tracking + task board updates ──────
+                # Accumulate tokens from tool result events (all depths).
+                if data.get("tokens"):
+                    self._total_tokens_used += data["tokens"]
+                    self._dirty = True
+
+                # Populate task board from task management tool events.
+                tool_name = data.get("tool", "")
+                if tool_name == "TaskCreate" and data.get("args"):
+                    args = data["args"]
+                    self._update_task({
+                        "task_id": f"t{len(self._task_board) + 1}",
+                        "subject": args.get("subject", "Untitled"),
+                        "status": args.get("status", "pending"),
+                        "active_form": args.get("active_form", ""),
+                    })
+                elif tool_name == "TaskUpdate" and data.get("args"):
+                    self._update_task(data["args"])
+                elif tool_name == "TaskList" and data.get("result"):
+                    try:
+                        parsed = json.loads(data["result"])
+                        tasks = parsed.get("tasks", []) if isinstance(parsed, dict) else []
+                        if tasks:
+                            self._ensure_task_board(tasks)
+                    except (json.JSONDecodeError, TypeError, AttributeError):
+                        pass
+
                 # ---- Sub-agent lane: render inline with a per-agent gutter ----
                 if depth >= 1 and entry.source in ("tool", "agent_status", "agent"):
                     self._route_subagent_event(entry, data)
@@ -242,22 +587,12 @@ class TerminalUI:
                 # ---- Orchestrator lane: existing main-pipeline rendering ----
                 # Route to specialized renderer based on entry source and data
                 if entry.source == "tool" and entry.data:
-                    if entry.data.get("result") is None and entry.data.get("error") is None:
-                        # Tool call (args but no result yet) — 'C' block leader.
-                        # Text renderer (not the Panel variant) so it composes with
-                        # the marker and MainPanel's row-wrap windowing.
-                        inner = OutputRenderer.render_tool_call(
-                            entry.data.get("tool", "unknown"),
-                            entry.data.get("args", {}),
-                        )
-                        rendered = self._wrap_block(BlockKind.TOOL, inner)
-                    else:
-                        # Tool output (result or error arrived) — joined under call with '⎿'.
-                        is_error = bool(entry.data.get("error"))
-                        content = entry.data.get("result") or entry.data.get("error", "")
-                        rendered = OutputRenderer.render_result_block(
-                            str(content), is_error=is_error
-                        )
+                    # Collapse the orchestrator's own tool calls into a single
+                    # in-place card (mirrors the sub-agent lane) instead of a full
+                    # call block + full output block per call.
+                    self._route_orchestrator_tool(entry.data)
+                    self._dirty = True
+                    continue
                 elif entry.source == "skill":
                     # Skill invocation
                     inner = OutputRenderer.render_skill_call(
@@ -325,11 +660,12 @@ class TerminalUI:
         self._dirty = False  # Start clean - CompatibleLive prints initial layout
 
     def render_layout(self) -> Layout:
-        """Create responsive layout: header + main + input + status.
+        """Create responsive layout: header + main + task_board + picker + input + status.
 
-        Parallel sub-agents are streamed inline into the main panel (each with its
-        own colored gutter), so there is no separate sub-agent region — the main
-        body always fills all space between header and input bar.
+        Dynamic interleaved regions (only rendered when non-zero height):
+          - task_board: between main and picker when tasks exist and not all-done.
+          - picker: between task_board/main and input when a question/approval is pending.
+        The input region stays at a compact 4 lines (processing indicator + input bar).
         """
         layout = Layout()
         width = self.console.width if self.console.width else 120
@@ -340,16 +676,32 @@ class TerminalUI:
         input_height = 4
         status_height = 1
 
-        # Calculate remaining height for scrollable main panel (fills all available space)
-        total_fixed = header_height + input_height + status_height
+        # Task board: between main and picker when tasks are live
+        task_board_height = 0
+        if self._task_board and self._all_done_at is None:
+            task_board_height = min(len(self._task_board) + 5, 14)
+
+        # Picker/approval overlay: between task_board and input when pending
+        picker_height = 0
+        if self._pending_approval:
+            picker_height = 12
+        elif self._pending_question:
+            n_opts = len(self._pending_question.get("options", []))
+            picker_height = min(n_opts * 3 + 10, 30)
+
+        # Calculate main height (shrinks as overlays grow)
+        total_fixed = header_height + input_height + status_height + task_board_height + picker_height
         main_height = max(10, height - total_fixed)
 
-        layout.split_column(
-            Layout(name="header", size=header_height),
-            Layout(name="main", size=main_height),
-            Layout(name="input", size=input_height),
-            Layout(name="status", size=status_height),
-        )
+        parts = [Layout(name="header", size=header_height)]
+        parts.append(Layout(name="main", size=main_height))
+        if task_board_height > 0:
+            parts.append(Layout(name="task_board", size=task_board_height))
+        if picker_height > 0:
+            parts.append(Layout(name="picker", size=picker_height))
+        parts.append(Layout(name="input", size=input_height))
+        parts.append(Layout(name="status", size=status_height))
+        layout.split_column(*parts)
 
         # Render header (metadata: branch, version, path)
         header_widget = self.header.render()
@@ -359,9 +711,43 @@ class TerminalUI:
         main_panel_widget = self.main_panel.render(main_height, width)
         layout["main"].update(main_panel_widget)
 
-        # Render pinned input bar at bottom
-        input_widget = self.input_bar.render()
-        layout["input"].update(input_widget)
+        # Render task board between main and picker
+        if task_board_height > 0:
+            tasks = list(self._task_board.values())
+            board = OutputRenderer.render_task_board(
+                tasks, self._task_board_goal,
+                show_cursor=self._task_blink_on,
+                total_tokens=self._total_tokens_used,
+            )
+            if board:
+                layout["task_board"].update(board)
+
+        # Render picker overlay (question card or permission prompt)
+        if picker_height > 0:
+            if self._pending_approval:
+                approval_panel = OutputRenderer.render_permission_prompt(
+                    tool=self._pending_approval["tool"],
+                    command_str=str(self._pending_approval.get("args", {})),
+                    risk=self._pending_approval["risk"],
+                    description="",
+                )
+                layout["picker"].update(approval_panel)
+            elif self._pending_question:
+                picker = OutputRenderer.render_picker_card(self._pending_question)
+                layout["picker"].update(picker)
+
+        # Render input area: processing indicator (when busy) + input bar
+        if self._is_processing:
+            indicator = OutputRenderer.render_processing_indicator(
+                self._is_processing, self._show_indicator, self._spinner_frame
+            )
+            combined = Text()
+            combined.append(indicator)
+            combined.append("\n")
+            combined.append(self.input_bar.render())
+            layout["input"].update(combined)
+        else:
+            layout["input"].update(self.input_bar.render())
 
         # Render pinned status bar at absolute bottom
         status_text = self.status_bar.render()
@@ -377,6 +763,35 @@ class TerminalUI:
                 if key is None:
                     await asyncio.sleep(0.01)
                     continue
+
+                # Intercept y/n for pending approval before normal input handling
+                if self._pending_approval:
+                    if key.lower() == "y":
+                        self._pending_approval["future"].set_result(True)
+                        self._pending_approval = None
+                        self._dirty = True
+                        await asyncio.sleep(0.001)
+                        continue
+                    elif key.lower() == "n":
+                        self._pending_approval["future"].set_result(False)
+                        self._pending_approval = None
+                        self._dirty = True
+                        await asyncio.sleep(0.001)
+                        continue
+                    # Ignore all other keys during approval prompt
+                    await asyncio.sleep(0.001)
+                    continue
+
+                # Intercept picker keys when a question is pending
+                if self._pending_question:
+                    consumed = await self._handle_picker_key(key)
+                    if consumed:
+                        await asyncio.sleep(0.001)
+                        continue
+                    # Fall through: let text keys through for "Other" mode
+                    if self._pending_question.get("mode") != "other":
+                        await asyncio.sleep(0.001)
+                        continue
 
                 # Handle text input
                 if self.input_handler.is_text_input(key):
@@ -397,23 +812,43 @@ class TerminalUI:
                 await asyncio.sleep(0.01)
 
     async def display_loop(self) -> None:
-        """Update display only on actual changes (message added or input cleared)."""
+        """Update display on changes + animate processing indicator and task board."""
         last_message_count = 0
         last_size = self.console.size
         while self.running and self.state.is_running:
             try:
-                # Update if: _dirty flag set, new messages added, or terminal resized
+                # ── Per-frame animation ─────────────────────────────────────
+
+                # Processing indicator: cycle spinner + blink every 4 frames
+                if self._is_processing:
+                    self._spinner_frame += 1
+                    if self._spinner_frame % 4 == 0:
+                        self._show_indicator = not self._show_indicator
+                        self._dirty = True
+
+                # Task board blinking cursor: toggle every 6 frames (600ms)
+                if self._task_board and self._all_done_at is None:
+                    self._task_blink_on = not self._task_blink_on
+                    self._dirty = True
+
+                # Task board: collapse 2s after all tasks complete
+                self._age_completed_tasks()
+
+                # ── Re-render on changes ────────────────────────────────────
                 current_message_count = len(self.main_panel.state.lines)
                 current_size = self.console.size
 
                 if self._dirty or current_message_count != last_message_count or current_size != last_size:
+                    # Coalesced markdown rebuild: fold any accumulated streamed
+                    # tokens into the active block once, here, rather than per token.
+                    self._flush_active_text()
                     layout = self.render_layout()
                     self._live.update(layout, refresh=True)
                     self._dirty = False
                     last_message_count = current_message_count
                     last_size = current_size
 
-                await asyncio.sleep(0.1)  # Check 10x per second, not per keystroke
+                await asyncio.sleep(0.1)  # 10fps
             except KeyboardInterrupt:
                 self.state.shutdown()
                 break
@@ -532,7 +967,9 @@ class TerminalUI:
         self.main_panel.add_text(self._render_subagent_card(state))
         state["line_idx"] = len(self.main_panel.state.lines) - 1
         # A sub-agent card closes any active assistant text block so reply text
-        # opens fresh below the cards (chronology preserved).
+        # opens fresh below the cards (chronology preserved). Flush pending tokens
+        # first so nothing streamed just before the card is dropped.
+        self._flush_active_text()
         self._active_text_idx = None
         self._active_text_raw = ""
         return state
@@ -594,15 +1031,114 @@ class TerminalUI:
 
         self._refresh_subagent_card(state)
 
+    # ---- Orchestrator tool card (depth 0) ----------------------------
+
+    def _ensure_orchestrator_card(self) -> dict:
+        """Return the orchestrator's live tool card, creating its line on first use.
+
+        Mirrors _ensure_subagent: appends one card line to the main body and
+        remembers its scrollback index so later calls re-render in place rather
+        than appending a new line per call. Creating a card also closes any active
+        assistant text block so prose that preceded this tool burst stays above it.
+        """
+        if self._orch_card is not None:
+            return self._orch_card
+
+        state = {
+            "status": "TOOL_CALLING",
+            "tool_count": 0,
+            "current_tool": "",
+            "output_lines": [],
+            "is_error": False,
+            "line_idx": None,
+        }
+        self._orch_card = state
+        self.main_panel.add_text(self._render_orchestrator_card(state))
+        state["line_idx"] = len(self.main_panel.state.lines) - 1
+        # Close the active assistant block; flush pending tokens first so nothing
+        # streamed just before the card is dropped.
+        self._flush_active_text()
+        self._active_text_idx = None
+        self._active_text_raw = ""
+        return state
+
+    def _render_orchestrator_card(self, state: dict):
+        """Build the Rich Text for the orchestrator card from its current state."""
+        return OutputRenderer.render_orchestrator_card(
+            status=state["status"],
+            tool_count=state["tool_count"],
+            current_tool=state["current_tool"],
+            output_lines=state["output_lines"],
+            is_error=state["is_error"],
+        )
+
+    def _refresh_orchestrator_card(self, state: dict) -> None:
+        """Re-render the orchestrator card in place (no new scrollback line)."""
+        idx = state.get("line_idx")
+        if idx is not None and idx < len(self.main_panel.state.lines):
+            self.main_panel.state.lines[idx] = self._render_orchestrator_card(state)
+        else:
+            # Card line was scrolled out of the bounded deque; re-append.
+            self.main_panel.add_text(self._render_orchestrator_card(state))
+            state["line_idx"] = len(self.main_panel.state.lines) - 1
+
+    def _route_orchestrator_tool(self, data: dict) -> None:
+        """Update the orchestrator's single in-place tool card from a tool event.
+
+        A call (no result/error yet) bumps the running count and becomes the card's
+        most-recent tool. A result/error attaches up to two output lines under that
+        call — an empty successful result renders as "No output" via the renderer.
+        """
+        state = self._ensure_orchestrator_card()
+        is_result = data.get("result") is not None or data.get("error") is not None
+
+        if not is_result:
+            state["tool_count"] += 1
+            state["status"] = "TOOL_CALLING"
+            state["current_tool"] = OutputRenderer.format_tool_compact(
+                data.get("tool", "unknown"),
+                data.get("args") or {},
+            )
+            # New call in flight: clear the prior call's output tail.
+            state["output_lines"] = []
+            state["is_error"] = False
+        else:
+            is_error = bool(data.get("error"))
+            content = data.get("error") if is_error else data.get("result")
+            state["is_error"] = is_error
+            state["output_lines"] = str(content or "").splitlines()
+
+        self._refresh_orchestrator_card(state)
+
     def _wrap_block(self, kind: str, inner):
         """Wrap a Channel-B event render with its 'C' block marker.
 
         Also closes any active assistant text block so the next streamed reply
         text starts a new block *below* this event (preserves chronology).
         """
+        # Fold any pending streamed tokens into the block before closing it,
+        # otherwise the last tokens before this event would be dropped.
+        self._flush_active_text()
         self._active_text_idx = None
         self._active_text_raw = ""
         return OutputRenderer.render_block(kind, inner)
+
+    def _flush_active_text(self) -> None:
+        """Rebuild the active assistant block from accumulated raw markdown.
+
+        Called at most once per display frame (from display_loop) and before any
+        event closes the active block. This collapses the per-token markdown
+        re-render (O(n²) over the reply) into one rebuild per frame, removing the
+        streaming stutter while keeping the block live.
+        """
+        if not self._text_dirty:
+            return
+        self._text_dirty = False
+        if self._active_text_idx is None or self._active_text_idx >= len(self.main_panel.state.lines):
+            return
+        self.main_panel.state.lines[self._active_text_idx] = OutputRenderer.render_block(
+            BlockKind.ASSISTANT, self._active_text_raw, markdown=True
+        )
 
     async def _handle_llm_prompt(self, prompt: str) -> None:
         """Stream LLM response for a prompt.
@@ -615,17 +1151,21 @@ class TerminalUI:
             self._dirty = True
             return
 
-        # Reset any stale active block; each prompt starts fresh.
+        # Reset per-prompt state; signal processing to the user.
+        self._is_processing = True
+        self._total_tokens_used = 0
         self._active_text_idx = None
         self._active_text_raw = ""
+        self._orch_card = None
 
         def append_chunk(chunk: str) -> None:
             """Append a streamed text chunk to the active assistant block.
 
-            Opens a new 'C' markdown block at the scrollback tail if none is
-            active (e.g. at the start, or after a tool/agent event closed the
-            previous one), otherwise re-renders the block in place with the
-            accumulated raw markdown.
+            Token arrival is kept cheap: opening a new block renders once, but
+            subsequent tokens only accumulate raw markdown and set _text_dirty.
+            The actual markdown rebuild is coalesced to one-per-frame in
+            display_loop via _flush_active_text, so a long reply no longer
+            re-renders its whole body on every token (was O(n²), the stutter).
             """
             if not chunk:
                 return
@@ -638,12 +1178,14 @@ class TerminalUI:
                 )
                 self.main_panel.add_text(rendered)
                 self._active_text_idx = len(self.main_panel.state.lines) - 1
+                self._text_dirty = False
+                # Prose resumed after a tool burst: retire the current orchestrator
+                # card so the next tool call opens a fresh card *below* this text.
+                self._orch_card = None
             else:
-                # Re-render the active block with accumulated markdown.
+                # Accumulate only; defer the markdown rebuild to the next frame.
                 self._active_text_raw += chunk
-                self.main_panel.state.lines[self._active_text_idx] = OutputRenderer.render_block(
-                    BlockKind.ASSISTANT, self._active_text_raw, markdown=True
-                )
+                self._text_dirty = True
             self._dirty = True
 
         try:
@@ -672,6 +1214,14 @@ class TerminalUI:
                     append_chunk(event.content)
         except Exception as e:
             self.main_panel.add_error(f"LLM error: {str(e)}")
+            self._dirty = True
+        finally:
+            # Signal idle; reset processing state.
+            self._is_processing = False
+
+            # Fold the final streamed tokens into the block once the stream ends,
+            # in case no further display frame ticks to flush them.
+            self._flush_active_text()
             self._dirty = True
 
     def shutdown(self) -> None:
