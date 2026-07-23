@@ -80,6 +80,7 @@ class StreamListener:
         args: dict,
         result: Optional[str] = None,
         error: Optional[str] = None,
+        tokens: int = 0,
         agent: Optional[str] = None,
         agent_id: Optional[str] = None,
         depth: int = 0,
@@ -88,6 +89,7 @@ class StreamListener:
 
         agent/agent_id/depth attribute the call to the (possibly parallel)
         sub-agent that issued it, so the UI can separate concurrent agents.
+        tokens is the approximate token cost of this tool execution.
         """
         message = f"Tool: {tool_name}"
         level = LogLevel.ERROR if error else LogLevel.INFO
@@ -96,6 +98,7 @@ class StreamListener:
             "args": args,
             "result": result,
             "error": error,
+            "tokens": tokens,
             "agent": agent,
             "agent_id": agent_id,
             "depth": depth,
