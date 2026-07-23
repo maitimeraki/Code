@@ -2,7 +2,7 @@
 
 import asyncio
 import hashlib
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Callable
 import structlog
 from datetime import datetime, timedelta
 
@@ -16,11 +16,17 @@ logger = structlog.get_logger(__name__)
 class ToolExecutor:
     """Execute tools with retry, caching, and circuit breaker."""
 
-    def __init__(self, router: ToolRouter, tool_timeout_seconds: Optional[int] = None):
+    def __init__(
+        self,
+        router: ToolRouter,
+        tool_timeout_seconds: Optional[int] = None,
+        approval_callback: Optional[Callable[[ToolType, Dict[str, Any], str], Any]] = None,
+    ):
         self.router = router
         self.cache: Dict[str, tuple[Any, datetime]] = {}
         self.cache_ttl = timedelta(hours=1)
         self.tool_timeout_seconds = tool_timeout_seconds or get_settings().tool_timeout_seconds
+        self.approval_callback = approval_callback
         self.retry_config = {
             ToolType.READ: {"max_retries": 2, "backoff": 0.5},
             ToolType.WRITE: {"max_retries": 1, "backoff": 1.0},
@@ -49,6 +55,62 @@ class ToolExecutor:
         **kwargs
     ) -> ToolResult:
         """Execute tool with retry and caching."""
+        # Opt-in HITL gate: when require_approval is on, ask for high-risk actions
+        # (rm -rf, git push, DB drops). If callback set → await user decision (inline).
+        # If no callback → fail-safe block (no human reachable). Autonomous default
+        # (flag off) is unchanged. Fail-open: a classifier hiccup never blocks.
+        if get_settings().require_approval:
+            try:
+                from harness.core.risk import classify_risk
+                risk = classify_risk(tool_type, kwargs)
+            except Exception:
+                risk = "low"
+            if risk == "high":
+                if self.approval_callback:
+                    # Ask human via UI callback; await decision
+                    try:
+                        approved = await self.approval_callback(tool_type, kwargs, risk)
+                        if not approved:
+                            logger.warning(f"Denied high-risk {tool_type.value} (user rejected)")
+                            return ToolResult(
+                                tool_call=ToolCall(
+                                    tool_type=tool_type,
+                                    args=kwargs,
+                                    status=ToolStatus.FAILED,
+                                    error=(
+                                        "User denied approval for this high-risk action. "
+                                        "Explain why it is needed if you wish to proceed."
+                                    ),
+                                )
+                            )
+                        # approved=True: fall through and execute
+                    except Exception as e:
+                        logger.error(f"Approval callback failed: {e}")
+                        # Fail-safe: block on callback error
+                        return ToolResult(
+                            tool_call=ToolCall(
+                                tool_type=tool_type,
+                                args=kwargs,
+                                status=ToolStatus.FAILED,
+                                error=f"Approval callback error: {e}",
+                            )
+                        )
+                else:
+                    # No callback set → fail-safe block
+                    logger.warning(f"Blocked high-risk {tool_type.value} (no approval_callback set)")
+                    return ToolResult(
+                        tool_call=ToolCall(
+                            tool_type=tool_type,
+                            args=kwargs,
+                            status=ToolStatus.FAILED,
+                            error=(
+                                "Blocked: this action is high-risk and requires human approval "
+                                "(REQUIRE_APPROVAL is enabled). Do not retry; explain what you "
+                                "intended and why it is needed."
+                            ),
+                        )
+                    )
+
         cache_key = self._cache_key(tool_type, **kwargs)
 
         # Check circuit breaker (with time-based reset for half-open retry)

@@ -8,15 +8,24 @@ from datetime import datetime
 
 class ToolType(Enum):
     """Supported tool types."""
-    READ = "read"
-    WRITE = "write"
-    EDIT = "edit"
-    BASH = "bash"
-    GREP = "grep"
-    GLOB = "glob"
-    GIT = "git"
-    HTTP = "http"
-    SPAWN_AGENT = "spawn_agent"
+    READ = "Read"
+    WRITE = "Write"
+    EDIT = "Update"
+    BASH = "Bash"
+    GREP = "Pattern"
+    GLOB = "Search"
+    GIT = "Git"
+    HTTP = "HTTP"
+    SPAWN_AGENT = "Agent"
+    ATTEMPT_COMPLETION = "Is_completion"
+    ASK_USER_QUESTION = "AskUserQuestion"
+    SKILL = "Skill"
+    TASK_CREATE = "TaskCreate"
+    TASK_GET = "TaskGet"
+    TASK_LIST = "TaskList"
+    TASK_OUTPUT = "TaskOutput"
+    TASK_STOP = "TaskStop"
+    TASK_UPDATE = "TaskUpdate"
 
 
 class ToolStatus(Enum):
