@@ -2,6 +2,7 @@
 
 import json
 import os
+from functools import lru_cache
 from typing import Any
 from pydantic_settings import BaseSettings
 from pydantic import BaseModel, Field
@@ -120,6 +121,19 @@ class Settings(BaseSettings):
     max_parallel_agents: int = Field(default=16, alias="MAX_PARALLEL_AGENTS")
     max_agent_retries: int = Field(default=3, alias="MAX_AGENT_RETRIES")
     tool_timeout_seconds: int = Field(default=1800, alias="TOOL_TIMEOUT_SECONDS")
+
+    # UI / Interaction
+    ask_question_timeout_seconds: int = Field(
+        default=0, alias="ASK_QUESTION_TIMEOUT_SECONDS",
+        description="Auto-continue timeout for AskUserQuestion. "
+                    "0=forever, 60=1min, 300=5min, 600=10min"
+    )
+
+    # Completion / loop guards (opt-in; autonomous defaults unchanged)
+    use_critic_verifier: bool = Field(default=False, alias="USE_CRITIC_VERIFIER")
+    max_wall_seconds: int = Field(default=0, alias="MAX_WALL_SECONDS")  # 0 = no cap
+    no_progress_limit: int = Field(default=0, alias="NO_PROGRESS_LIMIT")  # 0 = off
+    require_approval: bool = Field(default=False, alias="REQUIRE_APPROVAL")
 
     # Performance
     prompt_cache_size_mb: int = Field(default=500, alias="PROMPT_CACHE_SIZE_MB")
@@ -276,6 +290,7 @@ def export_env_from_settings() -> None:
         os.environ.setdefault(key, str(value))
 
 
+@lru_cache
 def get_settings() -> Settings:
-    """Load and return settings singleton."""
+    """Load and return settings singleton (cached for the process lifetime)."""
     return Settings()

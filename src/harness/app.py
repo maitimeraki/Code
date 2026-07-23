@@ -9,7 +9,6 @@ from harness.ui.terminal import TerminalUI
 from harness.orchestration import HarnessOrchestrator
 from harness.orchestration.llm_client import LLMClient
 from harness.core.task_manager import TaskStateManager
-from harness.core.loop import LoopController
 from harness.core.completion import CompletionChecker
 
 
@@ -34,6 +33,11 @@ class HarnessApp:
 
     async def run(self) -> None:
         """Main application loop (Phase 2: UI + Orchestration)."""
+        # Initialize persistent storage before anything touches the DB
+        # (task state, memory, approvals all depend on this). Idempotent.
+        from harness.persistence.database import init_db
+        await init_db()
+
         # If auto_command provided, execute it concurrently with UI
         if self.auto_command:
             # Run UI and auto-command concurrently
@@ -81,47 +85,23 @@ class HarnessApp:
             logger.error("Auto-command error", error=str(e))
 
     async def _run_task(self, task_description: str, max_iterations: int) -> None:
-        """Run a task automatically."""
+        """Run a task through the real orchestrator loop (agents + tools)."""
         self.ui.add_message(f"Running task: {task_description}")
-        manager = TaskStateManager(self.settings.get_data_dir())
-        controller = LoopController(self.settings.get_data_dir())
-
-        state = await manager.create_task(
-            description=task_description,
-            success_criteria={},
-            max_iterations=max_iterations,
-        )
-
-        async def dummy_work(s):
-            s.results["status"] = f"Iteration {s.iteration} completed"
-            self.ui.add_message(f"Iteration {s.iteration}/{max_iterations}")
-
-        controller.register_handler("execute", dummy_work)
-        checker = CompletionChecker.create_simple({})
-
-        result = await controller.run(state, checker)
-        self.ui.add_message(f"Task completed: {result.status.value}", level="success")
+        result = await self.orchestrator.run_task(task_description, max_iterations)
+        self.ui.add_message(f"Task finished: {result.status.value}", level="success")
 
     async def _resume_task(self, task_id: str) -> None:
-        """Resume a paused task."""
+        """Resume a paused task through the orchestrator's loop."""
         self.ui.add_message(f"Resuming task: {task_id}")
-        manager = TaskStateManager(self.settings.get_data_dir())
 
-        state = await manager.load_state(task_id)
-        if not state:
-            self.ui.add_message(f"No checkpoint found for task {task_id}", level="error")
-            return
+        self.orchestrator.register_handlers()
+        checker = CompletionChecker.create_simple({"agent_done": True})
 
-        controller = LoopController(self.settings.get_data_dir())
-
-        async def dummy_work(s):
-            s.results["status"] = f"Iteration {s.iteration} completed"
-
-        controller.register_handler("execute", dummy_work)
-        checker = CompletionChecker.create_simple({})
-
-        result = await controller.resume(task_id, checker)
-        self.ui.add_message(f"Task completed: {result.status.value}", level="success")
+        try:
+            result = await self.orchestrator.loop_controller.resume(task_id, checker)
+            self.ui.add_message(f"Task finished: {result.status.value}", level="success")
+        except ValueError as e:
+            self.ui.add_message(str(e), level="error")
 
     async def _show_status(self) -> None:
         """Show status of all tasks."""
@@ -155,10 +135,6 @@ class HarnessApp:
         self.ui.main_panel.add_info(f"Running task: {task_description}")
         state = await self.orchestrator.run_task(task_description)
         self.ui.main_panel.add_success(f"Task completed: {state.status.value}")
-
-    async def _resume_task(self, task_id: str) -> None:
-        """Resume a paused task."""
-        self.ui.main_panel.add_info(f"Resuming task: {task_id}")
 
     async def _show_task_status(self) -> None:
         """Display status of all tasks."""

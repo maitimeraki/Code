@@ -105,6 +105,8 @@ def run(
     configure_logging(settings.log_level)
 
     async def async_run():
+        from harness.persistence.database import init_db
+        await init_db()
         manager = TaskStateManager(settings.get_data_dir())
         controller = LoopController(settings.get_data_dir())
 
@@ -146,6 +148,8 @@ def resume(
     configure_logging(settings.log_level)
 
     async def async_resume():
+        from harness.persistence.database import init_db
+        await init_db()
         manager = TaskStateManager(settings.get_data_dir())
         controller = LoopController(settings.get_data_dir())
 
@@ -179,6 +183,8 @@ def status() -> None:
     configure_logging(settings.log_level)
 
     async def async_status():
+        from harness.persistence.database import init_db
+        await init_db()
         manager = TaskStateManager(settings.get_data_dir())
         task_ids = await manager.list_tasks()
 
