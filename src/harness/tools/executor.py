@@ -59,7 +59,10 @@ class ToolExecutor:
         # (rm -rf, git push, DB drops). If callback set → await user decision (inline).
         # If no callback → fail-safe block (no human reachable). Autonomous default
         # (flag off) is unchanged. Fail-open: a classifier hiccup never blocks.
-        if get_settings().require_approval:
+        # AskUserQuestion is exempt — it IS the user interaction mechanism.
+        if tool_type == ToolType.ASK_USER_QUESTION:
+            pass  # skip approval, this tool IS the user interaction
+        elif get_settings().require_approval:
             try:
                 from harness.core.risk import classify_risk
                 risk = classify_risk(tool_type, kwargs)
@@ -152,10 +155,16 @@ class ToolExecutor:
         last_result = None
         for attempt in range(max_retries + 1):
             try:
-                result = await asyncio.wait_for(
-                    self.router.call(tool_type, **kwargs),
-                    timeout=self.tool_timeout_seconds
-                )
+                # AskUserQuestion bypasses the executor's timeout — the UI handler
+                # (handle_ask_user_question) manages its own timeout using the
+                # user's ask_question_timeout_seconds setting (0 = forever).
+                if tool_type == ToolType.ASK_USER_QUESTION:
+                    result = await self.router.call(tool_type, **kwargs)
+                else:
+                    result = await asyncio.wait_for(
+                        self.router.call(tool_type, **kwargs),
+                        timeout=self.tool_timeout_seconds
+                    )
                 result.retry_count = attempt
                 result.total_retries = max_retries
 

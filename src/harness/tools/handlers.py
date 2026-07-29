@@ -221,11 +221,63 @@ async def task_update(
 # ── Spawn agent handler factory ───────────────────────────────────────────
 
 
+def _build_child_config(
+    parent_config: "AgentConfig",
+    name: str,
+    task: str,
+    working_dir: str = None,
+    success_criteria: str = None,
+    non_goals: list = None,
+    run_in_background: bool = False,
+    isolation: str = None,
+) -> "AgentConfig":
+    """Construct a pinned AgentConfig for a spawned child agent.
+
+    Shared by foreground and background spawn paths so the config is identical
+    regardless of execution mode.
+    """
+    from harness.orchestration.agent import MAX_SPAWN_DEPTH
+    if parent_config.spawn_depth >= MAX_SPAWN_DEPTH:
+        raise PermissionError(
+            f"Max agent spawn depth ({MAX_SPAWN_DEPTH}) reached; cannot spawn '{name}'"
+        )
+
+    available = {a.name for a in parent_config.agent_registry.list_agents()} if parent_config.agent_registry else set()
+    if name not in available:
+        raise ValueError(f"Unknown agent '{name}'. Available: {', '.join(sorted(available))}")
+
+    system_prompt = parent_config.agent_registry.get_full(name)
+
+    # Clamp the child's filesystem scope to working_dir when supplied.
+    child_scope = parent_config.permission_scope.without_agent_spawn()
+    if working_dir:
+        child_scope = child_scope.narrowed_to(working_dir)
+
+    return AgentConfig(
+        agent_type=name,
+        task_description=task,
+        system_prompt=system_prompt,
+        project_context=parent_config.project_context,
+        is_orchestrator=False,
+        agent_registry=None,
+        skill_registry=None,
+        permission_scope=child_scope,
+        spawn_depth=parent_config.spawn_depth + 1,
+        model=parent_config.model,
+        max_tool_iterations=parent_config.max_tool_iterations,
+        working_dir=working_dir,
+        success_criteria=success_criteria,
+        non_goals=non_goals,
+        run_in_background=run_in_background,
+        isolation=isolation,
+    )
+
+
 def make_spawn_agent_handler(
     agent_registry: "AgentRegistry",
     spawn_fn: Callable[["AgentConfig"], Awaitable[Any]],
     parent_config: "AgentConfig",
-) -> Callable[[str, str], Awaitable[str]]:
+) -> Callable[..., Awaitable[str]]:
     """Create a spawn_agent handler with closure over registry and spawner context."""
     from harness.orchestration.agent import MAX_SPAWN_DEPTH
 
@@ -235,22 +287,16 @@ def make_spawn_agent_handler(
         working_dir: str = None,
         success_criteria: str = None,
         non_goals: list = None,
+        run_in_background: bool = False,
+        isolation: str = None,
     ) -> str:
-        """Delegate a task to a named sub-agent in an isolated context."""
-        if parent_config.spawn_depth >= MAX_SPAWN_DEPTH:
-            raise PermissionError(
-                f"Max agent spawn depth ({MAX_SPAWN_DEPTH}) reached; cannot spawn '{name}'"
-            )
+        """Delegate a task to a named sub-agent in an isolated context.
 
-        available = {a.name for a in agent_registry.list_agents()}
-        if name not in available:
-            raise ValueError(f"Unknown agent '{name}'. Available: {', '.join(sorted(available))}")
-
-        system_prompt = agent_registry.get_full(name)
-
-        # Minimal, relevant context: the child gets only its self-contained task
-        # plus the harness's top known pitfalls (not orchestrator history/roster).
-        # Best-effort — a memory hiccup must never block delegation.
+        When *run_in_background* is True the agent is launched via
+        ``asyncio.create_task`` and a placeholder result is returned immediately.
+        """
+        # Ponytail: minimal, relevant context — the child gets only its
+        # self-contained task plus the harness's top known pitfalls.
         child_task = task
         try:
             from harness.core.error_memory import get_top_pitfalls
@@ -266,33 +312,22 @@ def make_spawn_agent_handler(
         except Exception:
             pass
 
-        # Clamp the child's filesystem scope to working_dir when supplied. This is
-        # the load-bearing half of the pin: two same-type agents in different
-        # folders are genuinely isolated because PathGuard denies cross-dir access.
-        child_scope = parent_config.permission_scope.without_agent_spawn()
-        if working_dir:
-            child_scope = child_scope.narrowed_to(working_dir)
-
-        # Sub-agents are strict executors: no roster, no skills, no re-delegation.
-        # The orchestrator owns decomposition and hands each child a self-contained
-        # task, pinned to an objective + success criteria + non-goals + scope.
-        child_config = AgentConfig(
-            agent_type=name,
-            task_description=child_task,
-            system_prompt=system_prompt,
-            project_context=parent_config.project_context,
-            is_orchestrator=False,
-            agent_registry=None,
-            skill_registry=None,
-            permission_scope=child_scope,
-            spawn_depth=parent_config.spawn_depth + 1,
-            model=parent_config.model,
-            max_tool_iterations=parent_config.max_tool_iterations,
-            working_dir=working_dir,
-            success_criteria=success_criteria,
-            non_goals=non_goals,
+        child_config = _build_child_config(
+            parent_config, name, child_task, working_dir,
+            success_criteria, non_goals, run_in_background, isolation,
         )
 
+        # Background spawn: fire-and-forget, return a placeholder immediately.
+        if run_in_background:
+            asyncio.create_task(spawn_fn(child_config))
+            return json.dumps({
+                "status": "background_spawned",
+                "agent": name,
+                "task": task[:200],
+                "note": "Running in background — results are not collected.",
+            })
+
+        # Sub-agents are strict executors — no roster, no skills, no re-delegation.
         result = await spawn_fn(child_config)
 
         # Structured return so the orchestrator ingests a capsule, not a transcript.
