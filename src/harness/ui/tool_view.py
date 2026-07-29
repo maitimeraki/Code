@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from typing import Dict, Optional
 from enum import Enum
 from rich.table import Table
-from .claude_code_style import Styles
 
 
 class ToolStatus(Enum):
@@ -41,10 +40,10 @@ class ToolView:
             self.tools[tool_id].status = ToolStatus.ERROR
 
     def render(self) -> Table:
-        table = Table(title="Tool Execution", show_header=True, header_style=Styles.TITLE)
-        table.add_column("Tool", style=Styles.PROMPT)
-        table.add_column("Status", style=Styles.INPUT_TEXT)
-        table.add_column("Result/Error", style=Styles.HINT)
+        table = Table(title="Tool Execution", show_header=True, header_style="#e4e4e7")
+        table.add_column("Tool", style="bold #e4e4e7")
+        table.add_column("Status", style="#a1a1aa")
+        table.add_column("Result/Error", style="#52525b")
 
         if not self.tools:
             table.add_row("(no tool calls)", "", "")

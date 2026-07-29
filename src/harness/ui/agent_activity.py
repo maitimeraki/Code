@@ -21,7 +21,6 @@ from rich.panel import Panel
 from rich.text import Text
 from rich.console import Group
 
-from .claude_code_style import Colors, Styles
 
 
 # Statuses that mean the agent is no longer doing work.
@@ -29,22 +28,22 @@ _TERMINAL = {"COMPLETED", "FAILED", "CANCELLED"}
 
 # Per-status glyph + color for the card header.
 _STATUS_STYLE = {
-    "RUNNING": ("🔄", Colors.AGENT_GOLD),
-    "THINKING": ("🧠", Colors.AGENT_GOLD),
-    "TOOL_CALLING": ("⚙", Colors.TOOL_CYAN),
-    "COMPLETED": ("✓", Colors.SUCCESS_GREEN),
-    "FAILED": ("✗", Colors.ERROR_RED),
-    "CANCELLED": ("⊘", Colors.TEXT_DIM),
+    "RUNNING": ("🔄", "#ffa657"),
+    "THINKING": ("🧠", "#ffa657"),
+    "TOOL_CALLING": ("⚙", "#79c0ff"),
+    "COMPLETED": ("✓", "#4ade80"),
+    "FAILED": ("✗", "#f87171"),
+    "CANCELLED": ("⊘", "#71717a"),
 }
 
 # Distinct border palette so adjacent parallel agents are visually separable.
 _BORDER_PALETTE = [
-    Colors.AGENT_GOLD,
-    Colors.ACCENT_PURPLE,
-    Colors.TOOL_CYAN,
-    Colors.ACCENT_BLUE,
-    Colors.SUCCESS_GREEN,
-    Colors.WARNING_YELLOW,
+    "#ffa657",
+    "#bc8ef7",
+    "#79c0ff",
+    "#60a5fa",
+    "#4ade80",
+    "#fbbf24",
 ]
 
 
@@ -153,30 +152,30 @@ class AgentActivityTracker:
     # ---- rendering ----------------------------------------------------
 
     def _render_card(self, activity: AgentActivity) -> Panel:
-        icon, color = _STATUS_STYLE.get(activity.status, ("•", Colors.TEXT_PRIMARY))
+        icon, color = _STATUS_STYLE.get(activity.status, ("•", "#e4e4e7"))
         border = _BORDER_PALETTE[activity.color_index]
 
         header = Text()
         header.append(f"{icon} ", style=f"bold {color}")
         header.append(activity.name, style="bold")
-        header.append(f"  #{activity.agent_id}", style=Styles.HINT)
+        header.append(f"  #{activity.agent_id}", style="#52525b")
 
         status_line = Text()
-        status_line.append("status: ", style=Styles.HINT)
+        status_line.append("status: ", style="#52525b")
         status_line.append(activity.status.lower(), style=color)
-        status_line.append(f"   step {activity.step}", style=Styles.HINT)
+        status_line.append(f"   step {activity.step}", style="#52525b")
 
         tool_line = Text()
-        tool_line.append("→ ", style=f"bold {Colors.TOOL_CYAN}")
+        tool_line.append("→ ", style="bold #79c0ff")
         if activity.status in _TERMINAL:
-            tool_line.append("done", style=Styles.HINT)
+            tool_line.append("done", style="#52525b")
         elif activity.current_tool:
-            tool_line.append(activity.current_tool, style=Styles.INPUT_TEXT)
+            tool_line.append(activity.current_tool, style="#a1a1aa")
         else:
-            tool_line.append("thinking…", style=Styles.AGENT_THINKING)
+            tool_line.append("thinking…", style="#52525b")
 
         if activity.task:
-            task_line = Text(activity.task[:60], style=Styles.HINT)
+            task_line = Text(activity.task[:60], style="#52525b")
             body = Group(header, status_line, tool_line, task_line)
         else:
             body = Group(header, status_line, tool_line)
@@ -202,13 +201,13 @@ class AgentActivityTracker:
         cards = [self._render_card(a) for a in self.agents.values()]
         running = sum(1 for a in self.agents.values() if a.status not in _TERMINAL)
         title = (
-            f"[bold {Colors.AGENT_GOLD}]Parallel Sub-Agents[/] "
+            f"[bold #ffa657]Parallel Sub-Agents[/] "
             f"[dim]({running} running / {len(self.agents)} shown)[/dim]"
         )
         return Panel(
             Columns(cards, expand=True, equal=True),
             title=title,
-            border_style=Styles.BORDER,
+            border_style="#3f3f46",
             padding=(0, 0),
         )
 

@@ -1,10 +1,10 @@
-"""Input bar component for terminal UI."""
+"""Input bar component — between two horizontal lines, Claude Code style."""
 
 from dataclasses import dataclass, field
-from typing import List, Optional, Callable, Awaitable
-from rich.console import Console
+from typing import List, Optional
 from rich.text import Text
-from .claude_code_style import Styles
+from rich.console import Console
+from .claude_code_style import Colors, Styles
 
 
 @dataclass
@@ -14,21 +14,15 @@ class InputBarState:
     history: List[str] = field(default_factory=list)
     history_index: int = -1
     cursor_pos: int = 0
-    hint: str = "< for agents"
-    in_palette_mode: bool = False
-    palette_buffer: str = ""
-    in_task_mode: bool = False
-    in_search_mode: bool = False
+    is_processing: bool = False
 
 
 class InputBar:
-    """Input prompt bar at bottom of terminal."""
+    """Input bar between two horizontal lines, always at screen bottom."""
 
     def __init__(self, console: Console):
         self.console = console
         self.state = InputBarState()
-        self.on_submit: Optional[Callable[[str], Awaitable[None]]] = None
-        self.on_buffer_change: Optional[Callable[[], Awaitable[None]]] = None
 
     def clear(self) -> None:
         """Clear input buffer."""
@@ -50,14 +44,10 @@ class InputBar:
 
     def delete_char(self) -> None:
         """Delete character before cursor."""
-        if self.state.in_palette_mode:
-            if self.state.palette_buffer:
-                self.state.palette_buffer = self.state.palette_buffer[:-1]
-        else:
-            if self.state.cursor_pos > 0:
-                pos = self.state.cursor_pos
-                self.state.buffer = self.state.buffer[:pos - 1] + self.state.buffer[pos:]
-                self.state.cursor_pos = max(0, pos - 1)
+        if self.state.cursor_pos > 0:
+            pos = self.state.cursor_pos
+            self.state.buffer = self.state.buffer[:pos - 1] + self.state.buffer[pos:]
+            self.state.cursor_pos = max(0, pos - 1)
 
     def set_buffer(self, text: str) -> None:
         """Set input buffer and cursor to end."""
@@ -83,44 +73,34 @@ class InputBar:
             return ""
         return None
 
-    def enter_palette_mode(self) -> None:
-        """Enter command palette mode."""
-        self.state.in_palette_mode = True
-        self.state.palette_buffer = ""
-        self.state.hint = "Type command (e.g. :run-task), press Enter to execute"
+    def get_current_input(self) -> str:
+        """Get current input buffer."""
+        return self.state.buffer
 
-    def exit_palette_mode(self) -> None:
-        """Exit command palette mode."""
-        self.state.in_palette_mode = False
-        self.state.palette_buffer = ""
-        self.state.hint = "< for agents"
+    def render(self) -> Text:
+        """Render input bar between two horizontal lines.
 
-    def render(self):
-        """Render input bar with semantic mode indicator and cursor.
-
-        Normal mode: purple prompt indicator + user input
-        Palette mode: blue command indicator + search input
-        Cursor always cyan for visual feedback.
+        Top line: ─────────────────────────────────────────────────
+        Input:    > |
+        Bottom line: ──────────────────────────────────────────────
         """
+        width = self.console.width if self.console.width else 80
+
         result = Text()
 
-        if self.state.in_palette_mode:
-            # Command mode: blue indicator
-            result.append(":", style="bold #58a6ff")
-            result.append(" ", style="bold #58a6ff")
-            result.append(self.state.palette_buffer, style="#e6edf3")
-        else:
-            # Normal mode: purple prompt indicator
-            result.append("❯ ", style="bold #bc8ef7")
-            result.append(self.state.buffer, style="#e6edf3")
+        # Top horizontal line
+        result.append("─" * width, style=Styles.INPUT_LINE)
+        result.append("\n")
 
-        # Cursor (always cyan for visibility)
-        result.append("█", style="#79c0ff")
+        # Input line: "> " + buffer + blinking cursor block
+        result.append("> ", style=Styles.USER_PROMPT)
+        result.append(self.state.buffer, style=Styles.USER_TEXT)
+        # ponytail: static cursor block (full block █) — Rich Live doesn't
+        # animate per-frame easily, so a constant block is the visual anchor.
+        result.append("█", style=Styles.USER_TEXT)
+        result.append("\n")
+
+        # Bottom horizontal line
+        result.append("─" * width, style=Styles.INPUT_LINE)
 
         return result
-
-    def get_current_input(self) -> str:
-        """Get current input (either buffer or palette buffer)."""
-        if self.state.in_palette_mode:
-            return self.state.palette_buffer
-        return self.state.buffer

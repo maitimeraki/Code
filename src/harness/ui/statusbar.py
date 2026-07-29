@@ -1,4 +1,4 @@
-"""Status bar component for terminal UI."""
+"""Status bar — permission mode + current file, Claude Code style."""
 
 from dataclasses import dataclass
 from rich.text import Text
@@ -8,61 +8,55 @@ from .claude_code_style import Styles
 
 @dataclass
 class StatusInfo:
-    """Status information displayed in status bar."""
-    project_name: str = "Agent Harness"
-    branch: str = "main"
-    has_changes: bool = False
-    status: str = "ready"
-    version: str = "0.1.0"
-    connected: bool = True
+    """Status information for the Claude Code-style status bar."""
+    permission_mode: str = "accept edits on"
+    current_file: str = ""
+    is_agent_mode: bool = False
 
 
 class StatusBar:
-    """Renders Claude Code-style status bar."""
+    """One-line status bar: permission mode on left, filename on right.
+
+    Layout:
+      ⏵ accept edits on (shift+tab to cycle) · ↵ for agents    ⧉ In definitions.py
+    """
 
     def __init__(self, console: Console):
         self.console = console
-        self.status_info = StatusInfo()
+        self.info = StatusInfo()
 
-    def update(self, info: StatusInfo) -> None:
+    def update(self, info: StatusInfo = None, **kwargs) -> None:
         """Update status information."""
-        self.status_info = info
+        if info:
+            self.info = info
+        for k, v in kwargs.items():
+            if hasattr(self.info, k):
+                setattr(self.info, k, v)
 
-    def render(self) -> Text:
-        """Render status bar with semantic status indicator and connection status.
+    def render(self):
+        """Render status bar: permission mode left, file info right."""
+        width = self.console.width if self.console.width else 80
 
-        Professional one-liner with icon, project metadata, and connection state.
-        Status colors: ready=green, executing=yellow, error=red, paused=dim.
-        """
-        status_icons = {
-            "ready": "✓",
-            "executing": "⟳",
-            "paused": "⏸",
-            "error": "⚠",
-        }
+        left = Text()
+        left.append("⏵ ", style=Styles.STATUS)
+        left.append(self.info.permission_mode, style=Styles.STATUS)
+        left.append(" (shift+tab to cycle)", style=Styles.STATUS_HINT)
+        left.append(" · ", style=Styles.STATUS)
+        left.append("↵ for agents", style=Styles.STATUS)
 
-        status_colors = {
-            "ready": "#3fb950",      # green
-            "executing": "#d29922",  # yellow
-            "paused": "#6e7681",     # dim
-            "error": "#f85149",      # red
-        }
+        right = Text()
+        if self.info.current_file:
+            right.append("  ⧉ ", style=Styles.STATUS)
+            right.append(f"In {self.info.current_file}", style=Styles.STATUS)
 
-        status_icon = status_icons.get(self.status_info.status, "?")
-        status_color = status_colors.get(self.status_info.status, "#6e7681")
-        connect_icon = "⟲" if self.status_info.connected else "✕"
-        connect_color = "#3fb950" if self.status_info.connected else "#f85149"
+        # Pad left to fill width, then append right
+        left_str = left.plain
+        right_str = right.plain
+        pad = max(0, width - len(left_str) - len(right_str) - 1)
 
-        # One-line status bar: icon + status, then metadata right-aligned
         result = Text()
-        result.append(f"{status_icon} {self.status_info.status} ", style=f"bold {status_color}")
-        result.append("· ", style="dim")
-        result.append(self.status_info.project_name, style="dim #6e7681")
-        result.append(" ", style="dim")
-        result.append(f"via {connect_icon}", style=f"dim {connect_color}")
+        result.append(left)
+        result.append(" " * pad, style=Styles.STATUS)
+        result.append(right)
 
         return result
-
-    def display(self) -> None:
-        """Print status bar to console."""
-        self.console.print(self.render())

@@ -1,269 +1,366 @@
-"""Render tool output and logs as Rich renderables in Claude Code style."""
+"""Inline renderers for terminal UI — ● is the universal progress indicator."""
 
 import json
-from datetime import datetime
-from typing import Optional, Union, Any
+from typing import Optional, Any
 from rich.text import Text
-from rich.syntax import Syntax
-from rich.table import Table
-from rich.panel import Panel
-from rich.columns import Columns
-from .claude_code_style import (
-    Styles,
-    BLOCK_MARKER,
-    RESULT_MARKER,
-    BlockKind,
-    BLOCK_MARKER_COLORS,
-)
+from .claude_code_style import Styles, Colors
 from .markdown_text import render_markdown
 
 
+def _format_args_compact(args: Optional[dict] = None, max_val: int = 40) -> str:
+    """Format tool arguments as a compact display string."""
+    if not args:
+        return ""
+
+    if "file_count" in args:
+        return f"({args['file_count']} files)"
+    paths = args.get("paths", [])
+    if isinstance(paths, list) and len(paths) > 1:
+        return f"({len(paths)} files)"
+    if isinstance(paths, list) and len(paths) == 1:
+        return paths[0]
+
+    for key in ("path", "pattern", "command", "name", "query", "url",
+                 "skill", "subject", "task_id", "taskId", "question", "file_path"):
+        val = args.get(key)
+        if val and isinstance(val, str):
+            s = str(val)
+            if len(s) > max_val:
+                s = s[:max_val] + "…"
+            return s
+
+    for v in args.values():
+        if isinstance(v, str):
+            s = v
+            if len(s) > max_val:
+                s = s[:max_val] + "…"
+            return s
+    return ""
+
+
+def _split_path(path: str) -> tuple[str, str]:
+    """Split a path into (dirname, basename) for styled display.
+
+    Returns ("", path) when there's no directory component.
+    """
+    import os.path
+    dirname = os.path.dirname(path)
+    basename = os.path.basename(path)
+    if not dirname:
+        return ("", basename)
+    return (dirname + "/", basename)
+
+
+def _truncate_front(path: str, max_len: int = 50) -> str:
+    """Truncate a path from the front, preserving the tail.
+
+    Returns "...eply/nested/path/file.py" when path exceeds max_len.
+    """
+    if len(path) <= max_len:
+        return path
+    return "…" + path[-(max_len - 1):]
+
+
+def _format_tool_args(tool: str, args: Optional[dict]) -> str:
+    """Format tool name + args as a plain string for display."""
+    arg_str = _format_args_compact(args)
+    if arg_str:
+        return f"{tool} {arg_str}"
+    return tool
+
+
 class OutputRenderer:
-    """Converts various output formats to Rich renderables."""
+    """Inline renderer — everything returns Rich Text, no panels or cards.
+
+    '●' is the universal progress indicator:
+      - Blinking ● → in progress (dim #888888)
+      - Green ●    → completed successfully (#4ade80)
+      - Red ●      → completed with error (#f87171)
+    """
+
+    # ── Block rendering ──────────────────────────────────────────
 
     @staticmethod
-    def _lead(kind: str) -> Text:
-        """Build the 'C ' block leader for a given block kind, colored per type.
+    def render_block(kind: str, body, markdown: bool = False) -> Text:
+        """Render a block as inline text.
 
-        Each block type has distinct color for semantic clarity:
-        - Assistant (coral): LLM responses
-        - Tool (cyan): Tool calls & execution
-        - Agent (gold): Agent spawning & status
-        - Skill (green): Skill invocation
-        - System (dim): Logs & metadata
+        When ``kind == "assistant"`` and markdown is ``True``, prepends
+        ``● `` (bold white big dot) before the rendered markdown so each
+        LLM output block is visually identified in the scrollback.
         """
-        color = BLOCK_MARKER_COLORS.get(kind, BLOCK_MARKER_COLORS[BlockKind.SYSTEM])
-        lead = Text()
-        lead.append(f"{BLOCK_MARKER} ", style=f"bold {color}")
-        return lead
-
-    @staticmethod
-    def render_block(kind: str, body: Text, markdown: bool = False) -> Text:
-        """Wrap `body` as a top-level block with the 'C' leader.
-
-        If `markdown` is True, `body` is treated as a markdown string (converted
-        via render_markdown) rather than a pre-built Text.
-        """
-        result = OutputRenderer._lead(kind)
         if markdown:
-            result.append(render_markdown(str(body)))
-        else:
-            result.append(body if isinstance(body, Text) else Text(str(body)))
-        return result
+            rendered = render_markdown(str(body))
+            if kind == "assistant":
+                prefix = Text("● ", style="bold white")
+                return prefix + rendered
+            return rendered
+        if isinstance(body, Text):
+            return body
+        return Text(str(body), style=Styles.AI)
+
+    # ── Tool display ─────────────────────────────────────────────
 
     @staticmethod
-    def render_result_block(body, is_error: bool = False) -> Text:
-        """Wrap `body` as a tool result, joined under its call with '⎿'.
+    def render_tool_call_line(tool: str, args: Optional[dict] = None,
+                               is_working: bool = False,
+                               is_error: bool = False,
+                               concurrent_count: int = 0) -> Text:
+        """Render a tool call line with leading colored dot indicator and path highlighting.
 
-        Long results are truncated to keep the scrollback readable.
-        Errors use red, success uses muted text.
+        The dot shows tool status at a glance:
+          ● (blinking gray) → in progress
+          ● (green)         → completed successfully
+          ● (red)           → completed with error
+
+        For file-reading tools (Read/Glob/Grep) the path is split into a dimmed
+        directory portion and a highlighted filename. Concurrent calls (multiple
+        reads in one LLM turn) show a count badge.
+
+        Working:  ● Read .../ui/terminal.py +2    ← blinking dot in progress
+        Success:  ● Read .../ui/terminal.py        ← green dot
+        Error:    ● Read .../ui/terminal.py         ← red dot
         """
         result = Text()
-        result.append(f"  {RESULT_MARKER} ", style="dim" if not is_error else "bold #f85149")
-        content = body if isinstance(body, str) else str(body)
-        style = "bold #f85149" if is_error else "dim"  # Red for errors, muted for success
-        truncated = content[:500]
-        result.append(truncated, style=style)
-        if len(content) > 500:
-            result.append("… (truncated)", style=Styles.HINT)
-        return result
+        if is_working:
+            dot_style = Styles.WORKING_BLINK
+        elif is_error:
+            dot_style = Styles.TOOL_DOT_ERROR
+        else:
+            dot_style = Styles.TOOL_DOT_SUCCESS
+        result.append("● ", style=dot_style)  # ● big dot
 
-    @staticmethod
-    def render_json(data: dict, title: Optional[str] = None) -> Union[Text, Table]:
-        """Render JSON data as a table or text."""
-        try:
-            if isinstance(data, list) and data and isinstance(data[0], dict):
-                table = Table(title=title or "Data")
-                keys = set()
-                for item in data:
-                    keys.update(item.keys())
+        # Show tool name
+        result.append(tool, style=Styles.TOOL)
 
-                for key in keys:
-                    table.add_column(str(key))
+        # Path-aware formatting for file-reading tools
+        read_tools = {"Read", "Grep", "Glob", "read", "grep", "glob"}
+        if tool in read_tools and args:
+            path_val = args.get("path") or args.get("pattern") or ""
+            if path_val and isinstance(path_val, str):
+                result.append(" ", style=Styles.TOOL)
+                dir_part, file_part = _split_path(path_val)
+                # Dir part: dimmed, front-truncated if long
+                dir_display = _truncate_front(dir_part, 45)
+                result.append(dir_display, style=Styles.TOOL_COUNT)
+                # File/basename part: brighter
+                result.append(file_part, style=Styles.TOOL)
+            else:
+                # Pattern-based (grep) — show pattern compactly
+                arg_str = _format_args_compact(args, max_val=50)
+                if arg_str:
+                    result.append(" ", style=Styles.TOOL)
+                    result.append(arg_str, style=Styles.TOOL)
+        else:
+            arg_str = _format_args_compact(args, max_val=50)
+            if arg_str:
+                result.append(" ", style=Styles.TOOL)
+                result.append(arg_str, style=Styles.TOOL)
 
-                for item in data:
-                    table.add_row(*[str(item.get(k, "")) for k in keys])
+        # Concurrent count badge
+        if concurrent_count > 0:
+            result.append(f" +{concurrent_count}", style=Styles.WORKING)
 
-                return table
-
-            json_str = json.dumps(data, indent=2)
-            return Syntax(json_str, "json", theme="monokai", line_numbers=False)
-        except Exception:
-            return Text(str(data), style=Styles.INPUT_TEXT)
-
-    @staticmethod
-    def render_code(code: str, language: str = "python", title: Optional[str] = None) -> Syntax:
-        """Render code block with syntax highlighting."""
-        return Syntax(
-            code,
-            language,
-            theme="monokai",
-            line_numbers=True,
-            title=title,
-            background_color="default",
-        )
-
-    @staticmethod
-    def render_error(message: str) -> Text:
-        """Render error message."""
-        return Text(f"Error: {message}", style=Styles.ERROR)
-
-    @staticmethod
-    def render_success(message: str) -> Text:
-        """Render success message."""
-        return Text(f"Success: {message}", style=Styles.SUCCESS)
-
-    @staticmethod
-    def render_info(message: str) -> Text:
-        """Render info message."""
-        return Text(f"Info: {message}", style=Styles.INFO)
-
-    @staticmethod
-    def render_log_entry(entry) -> Text:
-        """Render a log entry with timestamp and styling."""
-        timestamp = entry.timestamp.strftime("%H:%M:%S")
-
-        level_styles = {
-            "DEBUG": Styles.INPUT_TEXT,
-            "INFO": Styles.INFO,
-            "WARNING": Styles.INPUT_TEXT,
-            "ERROR": Styles.ERROR,
-            "CRITICAL": Styles.ERROR,
-        }
-
-        style = level_styles.get(entry.level.value, Styles.INPUT_TEXT)
-
-        text = Text()
-        text.append(f"[{timestamp}] ", style=Styles.HINT)
-        text.append(f"[{entry.source.upper()}] ", style=style)
-        text.append(entry.message, style=style)
-
-        return text
-
-    @staticmethod
-    def render_agent_thinking(text: str) -> Text:
-        """Render agent thinking with icon."""
-        result = Text()
-        result.append("🧠 ", style=Styles.INFO)
-        result.append(text, style=Styles.AGENT_THINKING)
         return result
 
     @staticmethod
     def render_tool_call(tool_name: str, params: dict = None) -> Text:
-        """Render a compact one-line tool call: name(arg=val, …).
-
-        Designed to sit under the 'C' block marker, so it carries no icon.
-        Tool name is bold cyan, params are muted for focus.
-        """
-        result = Text()
-        result.append(tool_name, style="bold cyan")
-        if params:
-            try:
-                arg_str = ", ".join(f"{k}={json.dumps(v)}" for k, v in params.items())
-            except (TypeError, ValueError):
-                arg_str = str(params)
-            if len(arg_str) > 200:
-                arg_str = arg_str[:200] + "…"
-            result.append(f"({arg_str})", style="dim")
-        else:
-            result.append("()", style="dim")
-        return result
+        """Render a compact one-line tool call (backward compat)."""
+        return OutputRenderer.render_tool_call_line(tool_name, params, is_working=False)
 
     @staticmethod
     def render_tool_output(tool_name: str, output: str, is_error: bool = False) -> Text:
-        """Render tool output with icon."""
-        result = Text()
-        result.append("📥 ", style=Styles.INFO)
-        style = Styles.ERROR if is_error else Styles.SUCCESS
-        result.append(f"{tool_name}: {output}", style=style)
-        return result
+        """Render tool output as inline text."""
+        return Text(output, style=Styles.STATUS if is_error else Styles.AI)
 
     @staticmethod
-    def render_event_tree(event_name: str, message: str, is_root: bool = True, indent: int = 0) -> Text:
-        """Render event in tree hierarchy with L-shaped indicator."""
-        indent_str = "  " * indent
-        tree_char = "L " if is_root else "├ "
+    def format_tool_compact(tool_name: str, args: Optional[dict] = None) -> Text:
+        """Compact one-line tool render with path highlighting."""
         result = Text()
-        result.append(indent_str + tree_char, style=Styles.BORDER)
-        result.append(event_name, style=Styles.TOOL_CALL)
-        result.append(f": {message}", style=Styles.INPUT_TEXT)
+        result.append(tool_name, style=Styles.TOOL)
+
+        # Path-aware formatting for file-reading tools
+        read_tools = {"Read", "Grep", "Glob", "read", "grep", "glob"}
+        if tool_name in read_tools and args:
+            path_val = args.get("path") or args.get("pattern") or ""
+            if path_val and isinstance(path_val, str):
+                result.append(" ", style=Styles.TOOL)
+                dir_part, file_part = _split_path(path_val)
+                dir_display = _truncate_front(dir_part, 35)
+                result.append(dir_display, style=Styles.TOOL_COUNT)
+                result.append(file_part, style=Styles.TOOL)
+                return result
+
+        arg_str = _format_args_compact(args)
+        if arg_str:
+            result.append(f" {arg_str}", style=Styles.TOOL)
         return result
 
-    @staticmethod
-    def render_llm_response_stream(content: str, model: str = "Claude") -> Text:
-        """Render streaming LLM response in Claude Code style."""
-        result = Text()
-        result.append(f"{model}: ", style="bold cyan")
-        result.append(content, style=Styles.INPUT_TEXT)
-        return result
+    # ── Edit diff display (with line numbers) ────────────────────
 
     @staticmethod
-    def render_agent_status(agent_name: str, status: str, detail: str = "") -> Text:
-        """Render agent status with icon and semantic color styling.
+    def render_edit_diff(diff_lines: list) -> Text:
+        """Render edit diff with line numbers.
 
-        Status indicators:
-        - SPAWNING/RUNNING: gold (action in progress)
-        - THINKING: gold (internal reasoning)
-        - TOOL_CALLING: cyan (external tool use)
-        - COMPLETED: green (success)
-        - FAILED: red (error)
-        - CANCELLED: dim (interrupted)
-        """
-        status_icons = {
-            "SPAWNING": "⚡",
-            "RUNNING": "🔄",
-            "THINKING": "🧠",
-            "TOOL_CALLING": "⚙️",
-            "COMPLETED": "✓",
-            "FAILED": "✗",
-            "CANCELLED": "⊘",
-        }
-        icon = status_icons.get(status, "→")
-
-        status_styles = {
-            "SPAWNING": "bold #ffa657",      # gold
-            "RUNNING": "bold #ffa657",       # gold
-            "THINKING": "#ffa657",           # gold (not bold for subtle)
-            "TOOL_CALLING": "bold #79c0ff",  # cyan
-            "COMPLETED": "bold #3fb950",     # green
-            "FAILED": "bold #f85149",        # red
-            "CANCELLED": "dim",              # muted
-        }
-        style = status_styles.get(status, Styles.INPUT_TEXT)
-
-        result = Text()
-        result.append(f"{icon} ", style=style)
-        result.append(f"[{agent_name}] ", style="bold")
-        result.append(status, style=style)
-        if detail:
-            result.append(f" — {detail}", style=Styles.HINT)
-        return result
-
-    @staticmethod
-    def format_tool_compact(tool_name: str, args: Optional[dict] = None, max_val: int = 32) -> Text:
-        """Compact one-line tool render for a sub-agent card: name(key=val).
-
-        Shows only the single most-informative argument, tightly truncated, so the
-        card stays on one line regardless of how many args the tool received.
+          - 23. throw new Error('Invalid credentials');
+          + 35. return null;
         """
         result = Text()
-        result.append(tool_name, style="bold cyan")
-        if not args:
-            result.append("()", style="dim")
+        for line in diff_lines:
+            if line.startswith("+"):
+                result.append(f"  {line}\n", style=Styles.DIFF_ADDED)
+            elif line.startswith("-"):
+                result.append(f"  {line}\n", style=Styles.DIFF_REMOVED)
+            else:
+                result.append(f"  {line}\n", style=Styles.TOOL_COUNT)
+        return result
+
+    # ── Bash output ──────────────────────────────────────────────
+
+    @staticmethod
+    def render_bash_output(output_lines: list, is_error: bool = False) -> Text:
+        """Render bash command output with indentation.
+
+        Indented 11 spaces to align just past the 'o ' prefix.
+        """
+        result = Text()
+        style = Styles.STATUS if is_error else Styles.TOOL_COUNT
+        indent = "           "  # 11 spaces
+        for line in output_lines[:8]:
+            result.append(f"{indent}{line}\n", style=style)
+        if len(output_lines) > 8:
+            result.append(f"{indent}… ({len(output_lines) - 8} more lines)", style=Styles.TOOL_COUNT)
+        return result
+
+    # ── Agent tree view ──────────────────────────────────────────
+
+    @staticmethod
+    def render_agent_tree(
+        agents: list[dict],
+        blink_on: bool = False,
+    ) -> Text:
+        """Render parallel agents as a tree with box-drawing characters.
+
+        ● Running 2 agents
+        │
+        ├─ ● code-reviewer(Checking patterns..)
+        │               Read path + 21 tools
+        │
+        └─ ● security-scan(Scanning for vulns..)
+                         Read path + 10 tools
+        """
+        if not agents:
+            return Text("")
+
+        result = Text()
+        _TERMINAL = {"COMPLETED", "FAILED", "CANCELLED"}
+        running = sum(1 for a in agents if a.get("status") not in _TERMINAL)
+
+        # Header
+        header_dot_style = Styles.TOOL_DOT_SUCCESS if running == 0 else (
+            Styles.WORKING_BLINK if blink_on else Styles.TOOL_DOT_SUCCESS
+        )
+        result.append(f"● Running {len(agents)} agent{'s' if len(agents) != 1 else ''}\n",
+                       style=Styles.TOOL_COUNT if running == 0 else Styles.TOOL)
+
+        for i, agent in enumerate(agents):
+            name = agent.get("name", "agent")
+            status = agent.get("status", "RUNNING")
+            desc = agent.get("description", agent.get("detail", agent.get("task", "")))
+            tool_count = agent.get("tool_count", 0)
+            current_tool = agent.get("current_tool", "")
+            is_terminal = status in _TERMINAL
+            is_last = i == len(agents) - 1
+
+            connector = "└─" if is_last else "├─"
+            if status in ("COMPLETED",):
+                dot_style = Styles.TOOL_DOT_SUCCESS
+            elif status in ("FAILED", "CANCELLED"):
+                dot_style = Styles.TOOL_DOT_ERROR
+            elif blink_on:
+                dot_style = Styles.WORKING_BLINK
+            else:
+                dot_style = Styles.TOOL_DOT_SUCCESS
+
+            result.append("│\n", style=Styles.TOOL_COUNT)
+            result.append(f"{connector} ", style=Styles.TOOL_COUNT)
+            result.append("● ", style=dot_style)
+            result.append(name, style=Styles.TOOL)
+            if desc:
+                d = desc[:40] + "…" if len(desc) > 40 else desc
+                result.append(f"({d})", style=Styles.TOOL_COUNT)
+
+            if is_terminal:
+                result.append(" Done", style=Styles.WORKING_SOLID)
+            result.append("\n")
+
+            # Second line: tool info under agent name
+            tool_info = ""
+            if current_tool:
+                tool_info += str(current_tool) + " "
+            if tool_count > 0:
+                tool_info += f"+ {tool_count} tool{'s' if tool_count != 1 else ''}"
+            if tool_info:
+                indent_width = 2 + 1 + len(name)
+                if is_last:
+                    result.append(" " * indent_width, style=Styles.TOOL_COUNT)
+                else:
+                    result.append("│" + " " * (indent_width - 1), style=Styles.TOOL_COUNT)
+                result.append(f" {tool_info}\n", style=Styles.TOOL_COUNT)
+
+        return result
+
+    # ── Processing indicator ─────────────────────────────────────
+
+    @staticmethod
+    def render_processing_indicator(
+        is_processing: bool,
+        show_indicator: bool,
+        tasks: Optional[list] = None,
+    ) -> Text:
+        """Render * Blinking... + |_ + task list in processing area when tasks exist.
+
+        When tasks exist and is_processing:
+          - * Blinking... header toggles on/off with show_indicator (both blink together)
+          - |_ tree connector always visible
+          - Task checkboxes: □ pending, ■ running, ■ strikethrough done
+        When no tasks or not processing: returns empty Text.
+        """
+        result = Text()
+        if not is_processing:
             return result
-        chosen_key = None
-        for key in ("path", "pattern", "command", "name", "query", "url",
-                     "skill", "subject", "task_id", "taskId", "question"):
-            if key in args and args[key]:
-                chosen_key = key
-                break
-        if chosen_key is None:
-            chosen_key = next(iter(args))
-        val = str(args[chosen_key])
-        if len(val) > max_val:
-            val = val[:max_val] + "…"
-        result.append(f"({chosen_key}={val})", style="dim")
+        if not tasks:
+            return result
+
+        # Header: * Blinking... (both toggle with show_indicator for blink effect)
+        if show_indicator:
+            result.append("* ", style=Styles.TASK_DOT_BROWN)
+            result.append("Blinking...", style=Styles.WORKING_BLINK)
+        result.append("\n")
+
+        # Tree connector
+        result.append("|_\n", style=Styles.OPTION_DETAIL)
+
+        # Task list
+        for task in tasks:
+            status = task.get("status", "pending")
+            subject = task.get("subject", task.get("name", "Untitled"))
+            if len(subject) > 55:
+                subject = subject[:55] + "…"
+            result.append("  ", style=Styles.OPTION_DETAIL)
+            if status == "completed":
+                result.append("■ ", style=Styles.TASK_BOX_DONE)
+                result.append(subject, style=Styles.TASK_TEXT_DONE)
+            elif status == "in_progress":
+                result.append("■ ", style=Styles.TASK_BOX_RUNNING)
+                result.append(subject, style=Styles.USER_TEXT)
+            else:
+                result.append("□ ", style=Styles.TASK_BOX_PENDING)
+                result.append(subject, style=Styles.TASK_META)
+            result.append("\n")
+
         return result
+
+    # ── Sub-agent card (legacy) ──────────────────────────────────
 
     @staticmethod
     def render_subagent_card(
@@ -272,508 +369,408 @@ class OutputRenderer:
         agent_name: str,
         status: str,
         tool_count: int,
-        current_tool: Union[Text, str, None] = None,
+        current_tool=None,
         detail: str = "",
         name_width: int = 12,
     ) -> Text:
-        """Render one sub-agent's in-place card line for the shared main body.
-
-        A single line per agent that is re-rendered in place as events arrive, so
-        20 tool calls collapse to a running count plus the most-recent call rather
-        than 20 separate lines. Layout:
-
-            <glyph> <name>  <status> · N tools · → <recent tool>
-
-        The gutter glyph+color is stable per agent so concurrent agents' cards stay
-        visually distinct within the orchestrator body.
-        """
-        status_styles = {
-            "SPAWNING": ("⚡", "bold #ffa657"),
-            "RUNNING": ("🔄", "bold #ffa657"),
-            "THINKING": ("🧠", "#ffa657"),
-            "TOOL_CALLING": ("⚙", "bold #79c0ff"),
-            "COMPLETED": ("✓", "bold #3fb950"),
-            "FAILED": ("✗", "bold #f85149"),
-            "CANCELLED": ("⊘", "dim"),
+        """Render a sub-agent status line inline (legacy, kept for compat)."""
+        status_icons = {
+            "SPAWNING": "⚡", "RUNNING": "🔄", "THINKING": "🧠",
+            "TOOL_CALLING": "⚙", "COMPLETED": "✓", "FAILED": "✗",
+            "CANCELLED": "⊘",
         }
-        icon, status_style = status_styles.get(status, ("→", Styles.INPUT_TEXT))
+        icon = status_icons.get(status, "→")
 
         result = Text()
         result.append(f"{glyph} ", style=f"bold {gutter_color}")
         result.append(f"{agent_name[:name_width]:<{name_width}} ", style=f"bold {gutter_color}")
-        result.append(f"{icon} ", style=status_style)
-        result.append(status.lower(), style=status_style)
-
-        result.append(f" · {tool_count} tool{'s' if tool_count != 1 else ''}", style=Styles.HINT)
+        result.append(f"{icon} ", style=Styles.TOOL)
+        result.append(status.lower(), style=Styles.TOOL)
+        result.append(f" · {tool_count} tool{'s' if tool_count != 1 else ''}",
+                       style=Styles.TOOL_COUNT)
 
         is_terminal = status in ("COMPLETED", "FAILED", "CANCELLED")
         if not is_terminal:
-            result.append("  → ", style="bold #79c0ff")
-            if current_tool is not None and (not isinstance(current_tool, str) or current_tool):
+            result.append("  → ", style=Styles.TOOL)
+            if current_tool:
                 result.append(current_tool if isinstance(current_tool, Text) else Text(str(current_tool)))
             else:
-                result.append("thinking…", style=Styles.AGENT_THINKING)
+                result.append("thinking…", style=Styles.TOOL_COUNT)
 
-        # Task detail is only shown before the agent starts calling tools; once
-        # tools flow, the recent-tool tail carries the signal and detail would
-        # push the card past one line.
         if detail and tool_count == 0:
-            result.append(f"   {detail[:50]}", style=Styles.HINT)
+            result.append(f"   {detail[:50]}", style=Styles.TOOL_COUNT)
+        return result
+
+    # ── Task Creation (polished task board) ─────────────────────
+
+    @staticmethod
+    def render_task_creation(
+        tasks: list,
+        goal: str = "",
+        total_tokens: int = 0,
+        active_form: str = "",
+        blink_on: bool = True,
+    ) -> Text:
+        """Render * Blinking... header + |_ tree + task checkboxes.
+
+        * Blinking... is the system-busy header.
+        |_ tree connector with task list underneath.
+        Each task: □ pending, ■ running, ■ strikethrough done.
+        Vanishes entirely when all tasks are done.
+        """
+        if not tasks:
+            return Text("")
+
+        # When all tasks complete the ENTIRE block vanishes
+        all_done = all(t.get("status") == "completed" for t in tasks)
+        if all_done:
+            return Text("")
+
+        result = Text()
+
+        # ── System indicator * Blinking... ────────────────────
+        result.append("* ", style=Styles.TASK_DOT_BROWN)
+        if blink_on:
+            result.append("Blinking...", style=Styles.WORKING_BLINK)
+        result.append("\n")
+
+        # ── Tree connector |_ ─────────────────────────────────
+        result.append("|_\n", style=Styles.OPTION_DETAIL)
+
+        # ── Task list under _ branch ──────────────────────────
+        for task in tasks:
+            status = task.get("status", "pending")
+            subject = task.get("subject", task.get("name", "Untitled"))
+            if len(subject) > 55:
+                subject = subject[:55] + "…"
+
+            result.append("  ", style=Styles.OPTION_DETAIL)
+
+            if status == "completed":
+                result.append("■ ", style=Styles.TASK_BOX_DONE)
+                result.append(subject, style=Styles.TASK_TEXT_DONE)
+            elif status == "in_progress":
+                result.append("■ ", style=Styles.TASK_BOX_RUNNING)
+                result.append(subject, style=Styles.USER_TEXT)
+            else:
+                result.append("□ ", style=Styles.TASK_BOX_PENDING)
+                result.append(subject, style=Styles.TASK_META)
+            result.append("\n")
+
+        return result
+
+    # ── Ask User Questions (tabbed form with keyboard nav) ─────
+
+    @staticmethod
+    def render_ask_user_questions(state: dict, width: int = 80) -> Text:
+        """Render a tabbed question form matching the Claude Code spec.
+
+        Layout:
+          ═════ thick divider
+          Overview text
+          [Tab 1] [Tab 2] [Submit]
+          active question panel
+          keybar
+          ═════ thick divider
+
+        Tab 0..N-1 = questions, Tab N = Submit.
+        Post-submit shows review block.
+        """
+        questions = state.get("questions", [])
+        current_tab = state.get("current_tab_index", 0)
+        focus_idx = state.get("current_focus_index", 0)
+        selections = state.get("selections", {})
+        custom_values = state.get("custom_values", {})
+        custom_focus = state.get("custom_focus")
+        submitted = state.get("submitted", False)
+        answers = state.get("answers", {})
+        overview = state.get("overview", "")
+        has_multi = state.get("multi_select", False)
+
+        result = Text()
+
+        # ── Thick top divider ──────────────────────────────────
+        divider = "═" * min(width, 80)
+        result.append(divider + "\n\n", style=Styles.DIVIDER)
+
+        # ── Overview text ──────────────────────────────────────
+        if overview:
+            result.append(overview + "\n\n", style=Styles.TOOL)
+
+        # ── Tabs row ────────────────────────────────────────────
+        if not submitted:
+            tab_labels = [q.get("label", f"Question {i+1}")
+                          for i, q in enumerate(questions)]
+            tab_labels.append("Submit")
+            for ti, label in enumerate(tab_labels):
+                if ti == current_tab:
+                    result.append(f" [{label}] ", style=Styles.TAB_ACTIVE)
+                else:
+                    result.append(f" {label} ", style=Styles.TAB_INACTIVE)
+            result.append("\n\n")
+
+        # ── Panel body ─────────────────────────────────────────
+        if submitted:
+            # Review block
+            result.append("── Answers submitted ──\n\n", style=Styles.REVIEW_TITLE)
+            for qi, q in enumerate(questions):
+                qtext = q.get("question", f"Question {qi+1}")
+                ans = answers.get(str(qi)) if isinstance(answers.get(str(qi)), str) else answers.get(qi, "")
+                display = str(ans) if ans else "(not answered)"
+                result.append(qtext + "\n", style=Styles.REVIEW_Q)
+                result.append(f"  → {display}\n", style=Styles.REVIEW_A)
+            result.append("\n")
+        elif current_tab < len(questions):
+            q = questions[current_tab]
+            qtext = q.get("question", "Question")
+            opts = q.get("options", [])
+
+            result.append(f"Q. {qtext}\n", style=Styles.AI)
+
+            for oi, opt in enumerate(opts):
+                is_focused = oi == focus_idx
+                is_selected = selections.get(current_tab) == oi or \
+                    (has_multi and oi in selections.get(current_tab, set()))
+                is_custom = opt.get("isCustom", False)
+
+                if is_focused:
+                    result.append("▸ ", style=Styles.CURSOR_BLINK)
+                else:
+                    result.append("  ", style=Styles.CURSOR_BLINK)
+
+                num = opt.get("num", oi + 1)
+                title = opt.get("title", f"Option {num}")
+                cstyle = Styles.OPTION_FOCUS if (is_focused or is_selected) else Styles.OPTION_NORMAL
+
+                result.append(f"{num}. ", style=Styles.TASK_BOX_PENDING)
+                result.append(title + "\n", style=cstyle)
+
+                detail = opt.get("detail", "")
+                if detail:
+                    ds = Styles.OPTION_DETAIL if is_focused else Styles.INPUT_PLACEHOLDER
+                    result.append(f"   {detail}\n", style=ds)
+
+                if is_custom and is_focused:
+                    cv = custom_values.get(current_tab, "")
+                    if custom_focus == current_tab:
+                        result.append(f"   > {cv}█\n", style=Styles.INPUT_FIELD)
+                    else:
+                        result.append(f"   > {cv}\n", style=Styles.INPUT_FIELD)
+
+            result.append("\n")
+            result.append(" ↑↓ navigate  ←→ switch section  Enter select/submit\n",
+                          style=Styles.KEYBAR_BG)
+        else:
+            result.append("Confirm your answers\n", style=Styles.SUBMIT_HEADING)
+            result.append("Review your selections above before submitting.\n",
+                          style=Styles.SUBMIT_DESC)
+            result.append("\n")
+            result.append("Press Enter to confirm and send\n", style=Styles.SUBMIT_HINT)
+
+        # ── Thick bottom divider ───────────────────────────────
+        result.append(divider + "\n", style=Styles.DIVIDER)
+
         return result
 
     @staticmethod
-    def render_orchestrator_card(
-        status: str,
-        tool_count: int,
-        current_tool: Union[Text, str, None] = None,
-        output_lines: Optional[list] = None,
-        is_error: bool = False,
-    ) -> Text:
-        """Render the main orchestrator's single in-place tool card.
-
-        Like a sub-agent card (status + running tool count + most-recent call),
-        but the orchestrator additionally shows up to two lines of the latest
-        tool's output beneath the call. A successful call with no output shows
-        "No output" instead of an empty tail. Layout:
-
-            ⚙ orchestrator  tool_calling · N tools  → recent(tool)
-              ⎿ <first output line>
-                <second output line>
-
-        Collapsing every call into this one re-rendered line is what keeps the
-        orchestrator from flooding scrollback with a block per call + full output.
-        """
-        status_styles = {
-            "SPAWNING": ("⚡", "bold #ffa657"),
-            "RUNNING": ("🔄", "bold #ffa657"),
-            "THINKING": ("🧠", "#ffa657"),
-            "TOOL_CALLING": ("⚙", "bold #79c0ff"),
-            "COMPLETED": ("✓", "bold #3fb950"),
-            "FAILED": ("✗", "bold #f85149"),
-            "CANCELLED": ("⊘", "dim"),
-        }
-        icon, status_style = status_styles.get(status, ("→", Styles.INPUT_TEXT))
-
+    def render_user_input(text: str) -> Text:
+        """Render user input with '>' prefix (ONLY place > is used)."""
         result = Text()
-        result.append(f"{icon} ", style=status_style)
-        result.append("orchestrator ", style="bold #79c0ff")
-        result.append(status.lower(), style=status_style)
-        result.append(
-            f" · {tool_count} tool{'s' if tool_count != 1 else ''}", style=Styles.HINT
-        )
-
-        is_terminal = status in ("COMPLETED", "FAILED", "CANCELLED")
-        if not is_terminal:
-            result.append("  → ", style="bold #79c0ff")
-            if current_tool is not None and (not isinstance(current_tool, str) or current_tool):
-                result.append(
-                    current_tool if isinstance(current_tool, Text) else Text(str(current_tool))
-                )
-            else:
-                result.append("thinking…", style=Styles.AGENT_THINKING)
-
-        # Output tail: up to two lines under the most-recent call, or a "No output"
-        # placeholder when the call finished with nothing to show.
-        out_style = "bold #f85149" if is_error else "dim"
-        lines = [ln for ln in (output_lines or []) if ln.strip()][:2]
-        if lines:
-            for i, line in enumerate(lines):
-                marker = RESULT_MARKER if i == 0 else " "
-                trimmed = line[:120]
-                result.append(f"\n  {marker} ", style=out_style)
-                result.append(trimmed, style=out_style)
-        elif tool_count > 0:
-            result.append(f"\n  {RESULT_MARKER} ", style=out_style)
-            result.append(
-                "No output" if not is_error else "failed", style=Styles.HINT
-            )
+        result.append("> ", style=Styles.USER_PROMPT)
+        result.append(text, style=Styles.USER_TEXT)
         return result
+
+    # ── AI response ─────────────────────────────────────────────
+
+    @staticmethod
+    def render_ai_response(text: str) -> Text:
+        """Render AI response text in light gray."""
+        return Text(text, style=Styles.AI)
+
+    # ── Agent/skill events ──────────────────────────────────────
 
     @staticmethod
     def render_skill_call(skill_name: str, params: Optional[dict] = None) -> Text:
-        """Render skill invocation with parameters."""
+        """Render skill invocation inline."""
         result = Text()
-        result.append("🎯 ", style=Styles.INFO)
-        result.append("Skill: ", style="bold")
-        result.append(skill_name, style="cyan")
-
+        result.append(f"Skill: {skill_name}", style=Styles.TOOL)
         if params:
             try:
-                params_str = json.dumps(params, indent=0)
-                result.append(f" {params_str}", style=Styles.HINT)
+                result.append(f" {json.dumps(params)}", style=Styles.TOOL_COUNT)
             except (TypeError, ValueError):
-                result.append(f" {params}", style=Styles.HINT)
+                result.append(f" {params}", style=Styles.TOOL_COUNT)
         return result
 
     @staticmethod
     def render_agent_call(agent_name: str, task: str, iteration: Optional[int] = None) -> Text:
-        """Render agent spawn event."""
+        """Render agent spawn inline."""
         result = Text()
-        result.append("🤖 ", style=Styles.INFO)
-        result.append("Agent: ", style="bold")
-        result.append(agent_name, style="magenta")
-
+        result.append(f"Agent \"{task}\"", style=Styles.TOOL)
+        result.append(f"  [agent: {agent_name}]", style=Styles.TOOL_COUNT)
         if iteration:
-            result.append(f" (iteration {iteration})", style=Styles.HINT)
-
-        result.append(f"\n  → {task}", style=Styles.INPUT_TEXT)
+            result.append(f"  (iteration {iteration})", style=Styles.TOOL_COUNT)
         return result
 
     @staticmethod
-    def render_tool_call_detailed(tool_name: str, params: dict, tool_id: str = "") -> Union[Text, Panel]:
-        """Render detailed tool call with formatted parameters."""
+    def render_agent_status(agent_name: str, status: str, detail: str = "") -> Text:
+        """Render agent status inline."""
+        status_icons = {
+            "SPAWNING": "⚡", "RUNNING": "🔄", "THINKING": "🧠",
+            "TOOL_CALLING": "⚙", "COMPLETED": "✓", "FAILED": "✗",
+            "CANCELLED": "⊘",
+        }
         result = Text()
-        result.append("⚙️  Tool: ", style="bold cyan")
-        result.append(tool_name, style="cyan")
-
-        if tool_id:
-            result.append(f" (id: {tool_id[:8]}...)", style=Styles.HINT)
-
-        # Format parameters
-        if params:
-            result.append("\n  Parameters:\n", style=Styles.HINT)
-            try:
-                params_str = json.dumps(params, indent=4)
-                # Add to syntax highlighted code block
-                syntax = Syntax(
-                    params_str,
-                    "json",
-                    theme="monokai",
-                    line_numbers=False,
-                    background_color="default",
-                )
-                return Panel(syntax, title="[cyan]Tool Call[/cyan]", expand=False)
-            except (TypeError, ValueError):
-                result.append(str(params), style=Styles.INPUT_TEXT)
-
+        result.append(f"{status_icons.get(status, '→')} ", style=Styles.TOOL)
+        result.append(f"[{agent_name}] ", style=Styles.TOOL)
+        result.append(status, style=Styles.TOOL)
+        if detail:
+            result.append(f" — {detail}", style=Styles.TOOL_COUNT)
         return result
 
     @staticmethod
-    def render_tool_result_detailed(tool_name: str, result_content: str, is_error: bool = False) -> Union[Text, Panel]:
-        """Render detailed tool result with error handling."""
-        style = Styles.ERROR if is_error else Styles.SUCCESS
-        icon = "❌" if is_error else "✅"
+    def render_llm_response_stream(content: str, model: str = "Claude") -> Text:
+        """Render streaming LLM response inline."""
+        return Text(content, style=Styles.AI)
 
-        # Try to render as JSON if result looks like JSON
+    @staticmethod
+    def render_agent_thinking(text: str) -> Text:
+        """Render agent thinking."""
+        return Text(text, style=Styles.TOOL_COUNT)
+
+    # ── Initial system messages ─────────────────────────────────
+
+    @staticmethod
+    def render_initial_system_messages() -> Text:
+        """Render the system messages that appear before first input."""
+        result = Text()
+        result.append("SessionStart:clear says: # claude-mem status\n\n", style=Styles.SYSTEM)
+        result.append(
+            "This project has no memory yet. The current session will seed it; "
+            "subsequent sessions will receive auto-injected context for relevant past work.\n\n",
+            style=Styles.SYSTEM)
+        result.append("Memory injection starts on your second session in a project.\n\n",
+                       style=Styles.SYSTEM)
+        result.append(
+            "'/learn-codebase' is available if the user wants to front-load the "
+            "entire repo into memory in a single pass (~5 minutes on a typical repo, "
+            "optional). Otherwise memory builds passively as work happens.\n\n",
+            style=Styles.SYSTEM)
+        result.append("Live activity: ", style=Styles.SYSTEM)
+        result.append("http://localhost:37777", style=Styles.SYSTEM_LINK)
+        result.append("\n")
+        result.append("How it works: ", style=Styles.SYSTEM)
+        result.append("/how-it-works", style=Styles.SYSTEM_COMMAND)
+        result.append("\n\n")
+        result.append("This message disappears once the first observation lands.\n\n",
+                       style=Styles.SYSTEM)
+        result.append("View Observations Live @ ", style=Styles.SYSTEM)
+        result.append("http://localhost:37777", style=Styles.SYSTEM_LINK)
+        return result
+
+    # ── Log entry ───────────────────────────────────────────────
+
+    @staticmethod
+    def render_log_entry(entry) -> Text:
+        """Render a log entry inline."""
+        result = Text()
+        result.append(f"[{entry.source}] ", style=Styles.TOOL_COUNT)
+        result.append(entry.message, style=Styles.AI)
+        return result
+
+    # ── Error / success / info ──────────────────────────────────
+
+    @staticmethod
+    def render_error(message: str) -> Text:
+        """Render error message."""
+        return Text(f"Error: {message}", style=Styles.STATUS)
+
+    @staticmethod
+    def render_success(message: str) -> Text:
+        """Render success message."""
+        return Text(f"Success: {message}", style=Styles.STATUS)
+
+    @staticmethod
+    def render_info(message: str) -> Text:
+        """Render info message."""
+        return Text(message, style=Styles.AI)
+
+    # ── JSON / code ─────────────────────────────────────────────
+
+    @staticmethod
+    def render_json(data: dict, title: Optional[str] = None) -> Text:
+        """Render JSON data inline."""
         try:
-            if isinstance(result_content, str) and result_content.strip().startswith(("{", "[")):
-                data = json.loads(result_content)
-                syntax = Syntax(
-                    json.dumps(data, indent=2),
-                    "json",
-                    theme="monokai",
-                    line_numbers=False,
-                    background_color="default",
-                )
-                title = f"[red]Tool Result (Error)[/red]" if is_error else f"[green]Tool Result[/green]"
-                return Panel(syntax, title=title, expand=False)
-        except (json.JSONDecodeError, TypeError, ValueError):
-            pass
-
-        # Fallback to plain text
-        result = Text()
-        result.append(f"{icon} ", style=style)
-        result.append(f"{tool_name}: ", style="bold")
-        result.append(result_content[:200], style=style)  # Truncate very long outputs
-        if len(result_content) > 200:
-            result.append("... (truncated)", style=Styles.HINT)
-        return result
+            s = json.dumps(data, indent=2)
+            lines = s.splitlines()[:10]
+            if len(s.splitlines()) > 10:
+                lines.append("…")
+            return Text("\n".join(lines), style=Styles.AI)
+        except Exception:
+            return Text(str(data), style=Styles.AI)
 
     @staticmethod
-    def render_question_card(
-        questions: list[dict],
-        multi_select: bool = False,
-        answers: Optional[dict] = None,
-    ) -> Text:
-        """Render an AskUserQuestion card with speech-bubble style.
+    def render_code(code: str, language: str = "python",
+                     title: Optional[str] = None) -> Text:
+        """Render code without syntax highlighting."""
+        lines = code.splitlines()
+        display = "\n".join(lines[:10])
+        if len(lines) > 10:
+            display += "\n… (truncated)"
+        return Text(display, style=Styles.AI)
 
-        Shows each question with its options, multi-select indicator, and
-        any answers the user has provided. Compact enough for inline display.
-        """
-        result = Text()
-        mode = "multi-select" if multi_select else "single-choice"
-        result.append(f"💬 ", style="bold #58a6ff")
-        result.append(f"Question ", style="bold #58a6ff")
-
-        if answers:
-            result.append(f"✓ ", style="bold #3fb950")
-            result.append(f"answered", style="bold #3fb950")
-        else:
-            result.append(f"· {mode}", style="dim")
-
-        for i, q in enumerate(questions):
-            label = q.get("question", q.get("label", f"Question {i + 1}"))
-            result.append(f"\n  {i + 1}. ", style="bold")
-            result.append(label, style=Styles.INPUT_TEXT)
-            options = q.get("options", q.get("answers", []))
-            for opt in options[:4]:  # Show first 4 options inline
-                opt_label = opt.get("label", opt.get("text", str(opt)[:30]))
-                result.append(f"\n     · {opt_label}", style=Styles.HINT)
-            if len(options) > 4:
-                result.append(f"\n     … +{len(options) - 4} more", style=Styles.HINT)
-
-        if answers:
-            result.append(f"\n  → ", style="dim")
-            result.append(str(answers), style="bold #3fb950")
-
-        return result
+    # ── Task cards ──────────────────────────────────────────────
 
     @staticmethod
-    def render_task_card(
-        task_id: str,
-        subject: str,
-        status: str = "pending",
-        description: str = "",
-    ) -> Text:
-        """Render a task card with status indicator.
-
-        Semantic coloring: pending (dim), in_progress (gold), completed (green),
-        failed (red).
-        """
+    def render_task_card(task_id: str, subject: str, status: str = "pending",
+                           description: str = "") -> Text:
+        """Render a task status card inline."""
         status_icons = {
-            "pending": "○",
-            "in_progress": "◷",
-            "completed": "✓",
-            "failed": "✗",
-            "deleted": "⊘",
-            "running": "▶",
-            "done": "✓",
+            "pending": "○", "in_progress": "◷", "completed": "✓",
+            "failed": "✗", "deleted": "⊘",
         }
-        status_styles = {
-            "pending": "dim",
-            "in_progress": "bold #ffa657",
-            "completed": "bold #3fb950",
-            "failed": "bold #f85149",
-            "deleted": "dim",
-            "running": "bold #79c0ff",
-            "done": "bold #3fb950",
-        }
-        icon = status_icons.get(status.lower(), "○")
-        style = status_styles.get(status.lower(), "dim")
-
         result = Text()
-        result.append(f"{icon} ", style=style)
-        result.append(f"[{task_id[:12]}] ", style=Styles.HINT)
-        result.append(subject, style="bold")
-        result.append(f" — {status}", style=style)
+        result.append(f"{status_icons.get(status.lower(), '○')} ", style=Styles.TOOL)
+        result.append(f"[{task_id[:12]}] ", style=Styles.TOOL_COUNT)
+        result.append(subject, style=Styles.AI)
+        result.append(f" — {status}", style=Styles.TOOL_COUNT)
         if description:
-            desc = description[:60] + "…" if len(description) > 60 else description
-            result.append(f"\n  {desc}", style=Styles.INPUT_TEXT)
+            result.append(f"\n  {description[:80]}{'…' if len(description) > 80 else ''}",
+                          style=Styles.AI)
         return result
 
     @staticmethod
-    def render_task_list_panel(
-        tasks: list[dict[str, Any]],
-        title: str = "Tasks",
-    ) -> Union[Panel, Text]:
-        """Render a task list as a compact Rich Panel or fallback Text.
-
-        Each task dict expects: id, subject, status. Optional: description.
-        Empty lists render as a muted 'no tasks' message.
-        """
+    def render_task_list_panel(tasks: list[dict[str, Any]], title: str = "Tasks") -> Text:
+        """Render a task list inline."""
         if not tasks:
-            return Text("No tasks", style=Styles.HINT)
-
-        table = Table(
-            title=title,
-            title_style="bold blue",
-            border_style=Styles.BORDER,
-            show_header=True,
-            header_style="bold",
-            box=None,
-            padding=(0, 1),
-        )
-        table.add_column("", width=2)  # status icon
-        table.add_column("ID", style=Styles.HINT, no_wrap=True)
-        table.add_column("Subject", style="bold")
-        table.add_column("Status")
-
-        status_icons = {
-            "pending": ("○", "dim"),
-            "in_progress": ("◷", "#ffa657"),
-            "completed": ("✓", "#3fb950"),
-            "failed": ("✗", "#f85149"),
-            "running": ("▶", "#79c0ff"),
-        }
-
-        for task in tasks:
-            s = task.get("status", "pending").lower()
-            icon, icon_style = status_icons.get(s, ("○", "dim"))
-            tid = task.get("id", task.get("task_id", ""))[:10]
-            subj = task.get("subject", task.get("name", ""))
-            table.add_row(
-                f"[{icon_style}]{icon}[/{icon_style}]",
-                tid,
-                subj,
-                f"[{icon_style}]{s}[/{icon_style}]",
-            )
-
-        return Panel(table, title=f"[bold blue]{title}[/bold blue]", border_style=Styles.BORDER)
-
-    @staticmethod
-    def render_iteration_separator(iteration: int, total: int) -> Panel:
-        """Render iteration separator banner."""
-        title = f"[bold cyan]Iteration {iteration}/{total}[/bold cyan]"
-        return Panel("", title=title, style=Styles.BORDER)
-
-    # ── Interactive UI components ──────────────────────────────────────────
-
-    @staticmethod
-    def render_processing_indicator(
-        is_processing: bool, show_indicator: bool, spinner_frame: int
-    ) -> Text:
-        """Render the input-bar processing indicator.
-
-        When the system is busy the indicator shows a cycling spinner + "Processing..."
-        text that blinks on/off every 4 frames (400ms). When idle only the prompt
-        marker ``❯ _`` is shown — no spinner, no text.
-        """
+            return Text("No tasks", style=Styles.TOOL_COUNT)
         result = Text()
-        if is_processing:
-            spinner_chars = ["🔄", "🔃", "🔄", "🔃"]
-            spinner = spinner_chars[spinner_frame % len(spinner_chars)]
-            if show_indicator:
-                result.append(f"{spinner} Processing...   ", style="bold #ffa657")
-            else:
-                result.append(" " * 22, style="dim")
-        result.append("❯ ", style="bold #bc8ef7")
-        result.append("_", style="#79c0ff")
+        for task in tasks:
+            result.append(
+                f"  {task.get('status', 'pending')} "
+                f"{task.get('id', task.get('task_id', ''))[:10]} "
+                f"{task.get('subject', task.get('name', ''))}\n",
+                style=Styles.AI)
         return result
 
     @staticmethod
-    def render_picker_card(state: dict) -> Panel:
-        """Render the interactive picker card for AskUserQuestion.
+    def render_iteration_separator(iteration: int, total: int) -> Text:
+        """Render iteration separator inline."""
+        return Text(f"── Iteration {iteration}/{total} ──", style=Styles.TOOL_COUNT)
 
-        Shows the question, a header chip (if present), numbered options
-        with keyboard focus highlighting, an "Other" text-input mode, and
-        a timeout countdown when one is active.
-        """
-        question = state.get("question", "")
-        header = state.get("header", "")
-        options = state.get("options", [])
-        multi_select = state.get("multi_select", False)
-        focus_idx = state.get("focus_index", 0)
-        selections = state.get("selections", set())
-        mode = state.get("mode", "options")
+    # ── Interactive UI components (replaced by render_ask_user_questions) --
 
-        content = Text()
-
-        # Question
-        content.append(f"  {question}", style="bold #e6edf3")
-        content.append("\n\n")
-
-        # Header chip
-        if header:
-            content.append(f"  {header}  ", style="bold #fbbf24 on #27272a")
-            content.append("\n\n")
-
-        if mode == "options":
-            for i, opt in enumerate(options):
-                label = opt.get("label", f"Option {i + 1}")
-                desc = opt.get("description", "")
-                is_focused = i == focus_idx
-                is_selected = i in selections
-
-                sel_mark = "◉" if is_selected else "○"
-                if multi_select:
-                    prefix = f"❯ {sel_mark}" if is_focused else f"  {sel_mark}"
-                else:
-                    prefix = "❯" if is_focused else " "
-
-                if is_focused:
-                    content.append(f"  {prefix} {i + 1}. {label}", style="bold #fbbf24")
-                    content.append("\n")
-                    if desc:
-                        content.append(f"     {desc}", style="#8b949e")
-                        content.append("\n")
-                else:
-                    content.append(f"  {prefix} {i + 1}. {label}", style="#8b949e")
-                    content.append("\n")
-                    if desc:
-                        content.append(f"     {desc}", style="#484f58")
-                        content.append("\n")
-                content.append("\n")
-
-            # Other option row
-            content.append("  ───────────────────────────────────", style="dim")
-            content.append("\n")
-            content.append("  [Other] Type your own answer...", style="#58a6ff")
-            content.append("\n")
-        else:
-            content.append("  Other: ", style="bold #e6edf3")
-            content.append("\n")
-            other_buf = state.get("other_buffer", "")
-            content.append(f"  {other_buf}_", style="#79c0ff")
-            content.append("\n")
-
-        # Timeout countdown (last 20 seconds)
-        timeout_at = state.get("timeout_at")
-        if timeout_at:
-            remaining = max(0, int((timeout_at - datetime.now()).total_seconds()))
-            if remaining <= 20:
-                content.append(f"  ⏱ Auto-continue in {remaining}s...", style="bold #f85149")
-                content.append("\n")
-
-        # Keyboard hints
-        n = len(options)
-        if mode == "options":
-            if multi_select:
-                content.append(
-                    f"  ↑↓ navigate · 1-{n} select · Space toggle · Tab Other · Enter confirm",
-                    style="dim",
-                )
-            else:
-                content.append(
-                    f"  ↑↓ navigate · 1-{n} select · Tab Other · Enter confirm",
-                    style="dim",
-                )
-        else:
-            content.append("  Enter submit · Esc cancel", style="dim")
-
-        return Panel(
-            content,
-            title="📋 Question",
-            title_align="left",
-            border_style="#58a6ff",
-            padding=(0, 1),
-        )
 
     @staticmethod
-    def render_task_board(
-        tasks: list,
-        goal: str = "",
-        show_cursor: bool = False,
-        total_tokens: int = 0,
-    ) -> Optional[Panel]:
-        """Render the live task board with status icons and progress bar.
-
-        Each task item dict expects: id, subject, status. Optional:
-        owner, blocked_by, active_form.  Completed tasks are shown
-        with strikethrough. A progress bar at the bottom shows the
-        completion ratio. Returns None when the task list is empty.
-
-        When show_cursor is True a blinking heartbeat cursor appears;
-        total_tokens shows accumulated token usage below the bar.
-        """
+    def render_task_board(tasks: list, goal: str = "",
+                           show_cursor: bool = False,
+                           total_tokens: int = 0) -> Optional[Text]:
+        """Render task board as inline text."""
         if not tasks:
             return None
 
-        status_icons = {
-            "pending": "○",
-            "in_progress": "🔄",
-            "completed": "✅",
-            "blocked": "⏸️",
-            "deleted": "🗑️",
-        }
-        status_colors = {
-            "pending": "#71717a",
-            "in_progress": "#fbbf24",
-            "completed": "#10b981",
-            "blocked": "#71717a",
-            "deleted": "#ef4444",
-        }
-
-        content = Text()
+        status_icons = {"pending": "○", "in_progress": "🔄", "completed": "✅",
+                         "blocked": "⏸", "deleted": "🗑"}
+        result = Text()
         completed = 0
         total = len(tasks)
 
@@ -781,105 +778,58 @@ class OutputRenderer:
             status = t.get("status", "pending")
             subject = t.get("subject", "Untitled")
             icon = status_icons.get(status, "○")
-            color = status_colors.get(status, "#71717a")
-
             if status == "completed":
                 completed += 1
-                content.append(f"  {icon} {i + 1}. {subject}", style=f"strikethrough {color}")
+                result.append(f"  {icon} {i + 1}. {subject}\n", style=Styles.TOOL_COUNT)
             else:
-                content.append(f"  {icon} {i + 1}. {subject}", style="bold #e6edf3")
-
-            # Annotations
+                result.append(f"  {icon} {i + 1}. {subject}\n", style=Styles.AI)
             if status == "in_progress":
                 owner = t.get("owner") or t.get("active_form", "")
                 if owner:
-                    content.append(f"  [{owner}]", style="dim")
-            elif status == "blocked":
-                blocked_by = t.get("blocked_by", set())
-                if blocked_by:
-                    refs = ", ".join(f"#{b}" for b in list(blocked_by)[:3])
-                    content.append(f"  [blocked by: {refs}]", style="dim")
+                    result.append(f"       [{owner}]\n", style=Styles.TOOL_COUNT)
 
-            content.append("\n")
-
-        # Progress bar
         pct = (completed / total * 100) if total > 0 else 0
         bar_width = 20
         filled = int(bar_width * completed / total) if total > 0 else 0
         bar = "█" * filled + "░" * (bar_width - filled)
-        content.append(f"  {'─' * 40}", style="dim")
-        content.append("\n")
-        content.append(f"  {completed} of {total}  {bar}  {int(pct)}%", style="dim")
-
-        # Blinking heartbeat cursor + token count
+        result.append(f"  {'─' * 40}\n", style=Styles.TOOL_COUNT)
+        result.append(f"  {completed} of {total}  {bar}  {int(pct)}%\n", style=Styles.TOOL_COUNT)
         if total_tokens:
-            content.append("\n")
-            content.append(f"  ⚡ {total_tokens}", style="#58a6ff")
+            result.append(f"  ⚡ {total_tokens}", style=Styles.SYSTEM_LINK)
         if show_cursor:
-            content.append("  ▎", style="#58a6ff")
-        else:
-            content.append("   ", style="dim")
-
-        title = f"{'✅ All done!' if completed == total else f'📋 {total - completed} tasks remaining'}"
-        return Panel(
-            content,
-            title=title,
-            title_align="left",
-            border_style="#30363d",
-            padding=(0, 1),
-        )
+            result.append("  ▎", style=Styles.SYSTEM_LINK)
+        return result
 
     @staticmethod
-    def render_permission_prompt(
-        tool: str, command_str: str, risk: str, description: str = ""
-    ) -> Panel:
-        """Render a permission prompt with amber border and command block."""
-        content = Text()
-        content.append(f"  Tool: ", style="bold #e6edf3")
-        content.append(tool, style="bold cyan")
-        content.append("\n\n")
-
-        # Code-style command block
-        cmd_trimmed = command_str[:80]
-        content.append(f"  ┌─{'─' * min(len(cmd_trimmed), 60)}─┐", style="dim")
-        content.append("\n")
-        content.append(f"  │ {cmd_trimmed}", style="#e6edf3")
-        content.append("\n")
-        content.append(f"  └─{'─' * min(len(cmd_trimmed), 60)}─┘", style="dim")
-        content.append("\n\n")
-
+    def render_permission_prompt(tool: str, command_str: str, risk: str,
+                                   description: str = "") -> Text:
+        """Render permission prompt as inline text."""
+        result = Text()
+        result.append(f"  Tool: {tool}\n", style=Styles.USER_TEXT)
+        result.append(f"  Command: {command_str[:80]}\n", style=Styles.AI)
         if description:
-            content.append(f"  {description}", style="#8b949e")
-            content.append("\n\n")
-
-        risk_color = "#f59e0b" if risk in ("high", "critical") else "#8b949e"
-        content.append(f"  Risk: {risk}", style=risk_color)
-        content.append("\n\n")
-        content.append("  [Y] Yes      [N] No      [A] Always      [S] Skip", style="bold cyan")
-        content.append("\n\n")
-        content.append("  ⚠ This action is destructive and cannot be undone.", style="bold #f85149")
-
-        return Panel(
-            content,
-            title="⚠ Permission Required",
-            title_align="left",
-            border_style="#f59e0b",
-            padding=(0, 1),
-        )
+            result.append(f"  {description}\n", style=Styles.AI)
+        risk_color = Styles.WORKING if risk in ("high", "critical") else Styles.TOOL_COUNT
+        result.append(f"  Risk: {risk}\n", style=risk_color)
+        result.append("\n  [Y] Yes   [N] No   [A] Always   [S] Skip", style=Styles.USER_TEXT)
+        return result
 
     @staticmethod
-    def render_question_confirmation(question: str, answer: str) -> Text:
-        """Render a question confirmation for the scrollback (after answering).
+    def render_question_confirmation(questions: list, answers: dict,
+                                     overview: str = "") -> Text:
+        """Render Q&A summary receipt after all sections answered.
 
-        Appends to the conversation history so the user can see what was asked
-        and what they answered. Format:
-            C 📋 <question>
-               → <answer>
+        Shows overview text (if provided) then each question with its answer.
         """
-        result = OutputRenderer._lead(BlockKind.SYSTEM)
-        result.append("📋 ", style="#58a6ff")
-        result.append(question, style="bold")
-        result.append("\n")
-        result.append("  → ", style="dim")
-        result.append(answer, style="bold #3fb950")
+        result = Text()
+        if overview:
+            result.append(f"  {overview}\n\n", style=Styles.USER_TEXT)
+        for qi, q in enumerate(questions):
+            qtext = q.get("question", f"Question {qi + 1}")
+            ans = answers.get(qi, "")
+            display = ans
+            if isinstance(ans, list):
+                display = ", ".join(ans)
+            result.append(f"  Q{qi + 1}. {qtext}\n", style=Styles.USER_TEXT)
+            result.append(f"       → {display}\n", style=Styles.PICKER_FOCUS)
         return result

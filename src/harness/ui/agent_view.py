@@ -5,7 +5,6 @@ from typing import List, Dict, Optional
 from enum import Enum
 from rich.table import Table
 from rich.text import Text
-from .claude_code_style import Styles
 
 
 class AgentStatus(Enum):
@@ -85,13 +84,13 @@ class AgentView:
 
     def render(self) -> Table:
         """Render agents as a Rich table."""
-        table = Table(title="Active Agents", show_header=True, header_style=Styles.TITLE)
-        table.add_column("Agent", style=Styles.PROMPT)
-        table.add_column("Status", style=Styles.INPUT_TEXT)
-        table.add_column("Tokens", style=Styles.HINT)
-        table.add_column("Iter", style=Styles.HINT)
-        table.add_column("Errors", style=Styles.HINT)
-        table.add_column("Update", style=Styles.HINT)
+        table = Table(title="Active Agents", show_header=True, header_style="#e4e4e7")
+        table.add_column("Agent", style="bold #e4e4e7")
+        table.add_column("Status", style="#a1a1aa")
+        table.add_column("Tokens", style="#52525b")
+        table.add_column("Iter", style="#52525b")
+        table.add_column("Errors", style="#52525b")
+        table.add_column("Update", style="#52525b")
 
         if not self.agents:
             table.add_row("(no active agents)", "", "", "", "", "")

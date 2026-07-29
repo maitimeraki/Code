@@ -10,7 +10,7 @@ through here — it must stay verbatim.
 
 import re
 from rich.text import Text
-from .claude_code_style import Colors
+from .claude_code_style import Styles, Colors
 
 # Inline token: bold (**x**), italic (*x* / _x_), or code (`x`).
 # Ordered so ** is matched before single *.
@@ -36,7 +36,7 @@ def _append_inline(text: Text, line: str) -> None:
         elif m.group("italic2") is not None:
             text.append(m.group("italic2"), style="italic")
         elif m.group("code") is not None:
-            text.append(m.group("code"), style=f"bold {Colors.TOOL_CYAN}")
+            text.append(m.group("code"), style=f"{Colors.SYSTEM_COMMAND}")
 
         pos = m.end()
 
@@ -67,17 +67,18 @@ def render_markdown(source: str) -> Text:
         stripped = raw_line.lstrip()
         indent = raw_line[: len(raw_line) - len(stripped)]
 
-        # Headings: # .. ###### → bold gold, hashes dropped.
+        # Headings: # .. ###### → bold, muted color.
         heading = re.match(r"^(#{1,6})\s+(.*)$", stripped)
         if heading:
             text.append(indent)
-            _append_inline_styled(text, heading.group(2), base_style=f"bold {Colors.AGENT_GOLD}")
+            _append_inline_styled(text, heading.group(2),
+                                   base_style=f"bold {Colors.AI_TEXT}")
             continue
 
         # Bullets: - / * / + → normalized bullet glyph.
         bullet = re.match(r"^[-*+]\s+(.*)$", stripped)
         if bullet:
-            text.append(f"{indent}• ", style=Colors.ASSISTANT_CORAL)
+            text.append(f"{indent}• ", style=Colors.AI_TEXT)
             _append_inline(text, bullet.group(1))
             continue
 

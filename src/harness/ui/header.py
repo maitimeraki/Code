@@ -1,4 +1,4 @@
-"""Responsive header component for Terminal UI."""
+"""AI Code Assistant-style header with pink logo, model info, and path."""
 
 from rich.text import Text
 from rich.console import Console
@@ -6,56 +6,56 @@ from .claude_code_style import Colors, Styles
 
 
 class Header:
-    """Renders responsive top metadata headers."""
+    """Renders the Claude Code header: logo, title, model, path.
+
+    Layout:
+      🟪  AI Code Assistant v1.0
+          cc/deepseek-v4-flash-free with high effort · API Usage Billing
+          ~/Desktop/AI AGENTS/Code
+    """
 
     def __init__(self, console: Console):
         self.console = console
-        self.branch = "main"
-        self.version = "0.1.0"
-        self.path = "harness"
-        self.command_context = ""
+        self._model = "cc/deepseek-v4-flash-free"
+        self._effort = "high effort"
+        self._billing = "API Usage Billing"
+        self._path = r"~\Desktop\AI AGENTS\Code"
+        self._version = "v1.0"
+        self._title = "AI Code Assistant"
 
-    def update(self, branch: str = None, version: str = None, path: str = None, context: str = None) -> None:
-        """Update header information."""
-        if branch:
-            self.branch = branch
-        if version:
-            self.version = version
-        if path:
-            self.path = path
-        if context:
-            self.command_context = context
-
-    def render_line1(self) -> Text:
-        """Render first header line: project name + branch + version + status.
-
-        Clean, professional header with semantic colors:
-        - Project name & branch: blue (identity)
-        - Version: yellow/warning (metadata)
-        - Status: green (ready)
-        """
-        line = Text()
-        line.append("Agent Harness ", style="bold #58a6ff")
-        line.append("on ", style="dim")
-        line.append(self.branch, style="bold #58a6ff")
-        line.append(" · ", style="dim")
-        line.append(f"v{self.version}", style="dim #d29922")
-        line.append(" · ", style="dim")
-        line.append("ready", style="#3fb950")
-        return line
-
-    def render_line2(self) -> Text:
-        """Render second header line: system path + command context (muted)."""
-        line = Text()
-        line.append(self.path, style="dim #6e7681")
-        if self.command_context:
-            line.append(f"  {self.command_context}", style="dim #6e7681")
-        return line
+    def update(self, model: str = None, effort: str = None,
+               billing: str = None, path: str = None) -> None:
+        """Update header information dynamically."""
+        if model is not None:
+            self._model = model
+        if effort is not None:
+            self._effort = effort
+        if billing is not None:
+            self._billing = billing
+        if path is not None:
+            self._path = path
 
     def render(self) -> Text:
-        """Render both header lines stacked."""
-        header = Text()
-        header.append(self.render_line1())
-        header.append("\n")
-        header.append(self.render_line2())
-        return header
+        """Render the three-line Claude Code header."""
+        h = Text()
+
+        # Line 1: 🟪  Claude Code v2.1.191
+        h.append("🟪", style=Styles.LOGO)
+        h.append("  ", style=Styles.HEADER_META)
+        h.append(f"{self._title} ", style=Styles.HEADER_TITLE)
+        h.append(self._version, style=Styles.HEADER_META)
+        h.append("\n")
+
+        # Line 2: model · billing (indented)
+        h.append("    ", style=Styles.HEADER_META)
+        h.append(self._model, style=Styles.HEADER_META)
+        h.append(f" with {self._effort}", style=Styles.HEADER_META)
+        h.append(" · ", style=Styles.HEADER_META)
+        h.append(self._billing, style=Styles.HEADER_META)
+        h.append("\n")
+
+        # Line 3: path (indented)
+        h.append("    ", style=Styles.HEADER_META)
+        h.append(self._path, style=Styles.HEADER_META)
+
+        return h
