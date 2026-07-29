@@ -70,6 +70,8 @@ class AgentConfig:
     working_dir: Optional[str] = None
     success_criteria: Optional[str] = None
     non_goals: Optional[list] = None
+    run_in_background: bool = False
+    isolation: Optional[str] = None
 
     # --- Capability set (drives capability-scoped prompt fragments) ------ #
     # Explicit tool names this agent holds. When set, the fragment gates read

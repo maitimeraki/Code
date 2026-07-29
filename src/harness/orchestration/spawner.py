@@ -224,7 +224,7 @@ class AgentSpawner:
             # Build tools payload for LLM (normalize empty → None so we never send tools=[])
             tools_payload = None
             if router.handlers:
-                tools_payload = get_tools_payload(router, agent_registry=config.agent_registry) or None
+                tools_payload = get_tools_payload(router) or None
 
             # Initialize messages with optional system prompt and project context
             messages = []
@@ -480,7 +480,7 @@ class AgentSpawner:
                     "FAILED" if result.status == AgentStatus.FAILED else
                     result.status.value.upper()
                 )
-                detail = result.error or (f"{result.iterations} iter" if result.iterations else "")
+                detail = result.error or (result.output or "")[:80] or (f"{result.iterations} iter" if result.iterations else "")
                 try:
                     await self.stream_listener.log_agent_status(
                         agent_name=config.agent_name,
