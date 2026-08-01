@@ -279,6 +279,14 @@ class AgentSpawner:
 
             if system_content:
                 messages.append({"role": "system", "content": system_content})
+
+            # Replay this session's earlier turns so the model has continuity.
+            # Orchestrator-only: _build_child_config never sets prior_turns, so
+            # sub-agents keep their isolated context.
+            for turn in config.prior_turns:
+                messages.append({"role": "user", "content": turn["prompt"]})
+                messages.append({"role": "assistant", "content": turn["summary"]})
+
             messages.append({"role": "user", "content": config.task_description})
 
             # POST_TASK re-assertion: computed once, injected before the child's

@@ -3,6 +3,7 @@
 import asyncio
 from pathlib import Path
 from typing import Optional
+from uuid import uuid4
 import structlog
 
 from harness.core.loop import LoopController
@@ -13,11 +14,16 @@ from harness.registry.definitions import AgentRegistry, SkillRegistry, ensure_se
 from harness.tools.permissions import PermissionScope
 from harness.ui import TerminalUI, StreamListener, LogEntry, LogLevel
 from harness.config import get_settings
+from harness.memory import build_briefing
+from harness.persistence.session import SessionManager
 from .agent import AgentConfig, AgentType
 from .spawner import AgentSpawner
 from .llm_client import LLMClient
 
 logger = structlog.get_logger(__name__)
+
+MAX_LEDGER_TURNS = 6
+TURN_SUMMARY_CHARS = 600
 
 
 class HarnessOrchestrator:
@@ -55,6 +61,33 @@ class HarnessOrchestrator:
             ask_user_question_callback=ui.ask_user_question_callback if ui else None,
         )
 
+        # Session management and briefing
+        self.session_id: Optional[str] = None
+        self.briefing_text: Optional[str] = None
+        self._session_manager = SessionManager()
+        self.turns: list[dict] = []
+
+    async def ensure_session(self) -> str:
+        """Create the session row + build the briefing. Idempotent; first call wins."""
+        if self.session_id is not None:
+            return self.session_id
+
+        settings = get_settings()
+        user_id = settings.user_id
+
+        # Create session in database
+        self.session_id = await self._session_manager.create_session(
+            user_id=user_id,
+            metadata={"project_root": str(self.project_context.root)},
+        )
+
+        # Build the briefing from prior sessions
+        briefing = await build_briefing(self.session_id, user_id, self.project_context.root)
+        self.briefing_text = briefing.text
+
+        logger.info(f"Session created: {self.session_id}", briefing_chars=len(self.briefing_text or ""))
+        return self.session_id
+
     def compose_capsule(self, agent_result) -> dict:
         """Compose token-efficient capsule from agent result.
 
@@ -72,6 +105,18 @@ class HarnessOrchestrator:
                 "output": getattr(agent_result, "output_tokens", 0),
             }
         }
+
+    def _record_turn(self, prompt: str, result) -> None:
+        """Append a compact record of a finished turn, keeping only the newest N."""
+        if result is None:
+            return
+        if getattr(result, "success", False):
+            summary = (result.output or "")[:TURN_SUMMARY_CHARS]
+        else:
+            summary = f"FAILED: {(result.error or 'unknown error')[:TURN_SUMMARY_CHARS]}"
+
+        self.turns.append({"prompt": prompt[:TURN_SUMMARY_CHARS], "summary": summary})
+        del self.turns[:-MAX_LEDGER_TURNS]
 
     def compose_system_message(self) -> str:
         """Compose the chat system message from loaded project context + registries."""
@@ -100,12 +145,15 @@ class HarnessOrchestrator:
         return AgentConfig(
             agent_type="main",
             task_description=task_description,
+            context={"session_id": self.session_id, "task_id": uuid4().hex},
             project_context=self.project_context,
             agent_registry=self.agent_registry,
             skill_registry=self.skill_registry,
             permission_scope=PermissionScope.default_for_project(self.project_context.root),
             is_orchestrator=True,
             verify_command=verify_command,
+            briefing_text=self.briefing_text,
+            prior_turns=list(self.turns),
         )
 
     async def chat(self, prompt: str, on_text_delta=None):
@@ -115,7 +163,9 @@ class HarnessOrchestrator:
         can actually read/write/run commands and delegate to sub-agents.
         """
         config = self._build_main_agent_config(prompt)
-        return await self.agent_spawner.spawn(config, on_text_delta=on_text_delta)
+        result = await self.agent_spawner.spawn(config, on_text_delta=on_text_delta)
+        self._record_turn(prompt, result)
+        return result
 
     def _log_to_ui(self, message: str, level: str = "info") -> None:
         """Log message to UI stream."""
@@ -159,12 +209,21 @@ class HarnessOrchestrator:
                     "Diagnose the cause, fix it, and continue the task to completion."
                 )
 
+            # Tier 2 memory: inject prior recovery hint if available (Phase 5)
+            last_recovery_hint = state.results.get("last_recovery_hint")
+            if last_recovery_hint:
+                task += (
+                    f"\n\nA prior session resolved this same error as follows:\n{last_recovery_hint}\n"
+                    "Apply this if it fits; if not, say why and solve it differently."
+                )
+
             config = self._build_main_agent_config(task, verify_command=verify_command)
 
             def on_text_delta(text: str) -> None:
                 self._log_to_ui(text, "agent_output")
 
             result = await self.agent_spawner.spawn(config, on_text_delta=on_text_delta)
+            self._record_turn(state.description, result)
 
             if result.success:
                 # Compose token-efficient capsule for next iteration
@@ -173,6 +232,23 @@ class HarnessOrchestrator:
                 state.result = str(capsule["summary"])
                 state.results["agent_done"] = True
                 state.results["last_error"] = None
+
+                # Phase 5: Learn from successful recovery
+                error_sig = state.results.get("last_error_signature")
+                if error_sig and not state.results.get("last_recovery_hint"):
+                    # Only record newly solved errors (not re-runs of known solutions)
+                    from harness.core.error_memory import suggest_recovery, add_solution
+                    await suggest_recovery(error_sig, result.output[:1000])
+                    state.results["last_error_signature"] = None
+
+                    # Fast recovery: promote to knowledge base if solved early
+                    if state.iteration <= 2:
+                        task_type = error_sig.split("_")[0] if error_sig else "unknown"
+                        await add_solution(
+                            task_type=task_type,
+                            solution=result.output[:1000],
+                            quality_score=0.6
+                        )
             else:
                 # Feed the failure into the next iteration instead of aborting.
                 error = result.error or "Agent failed without an error message"

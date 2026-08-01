@@ -83,6 +83,20 @@ class AgentConfig:
     # Output token budget for this run (surfaced in the context-mode doctrine).
     token_budget: Optional[int] = None
 
+    # Session briefing for orchestrator continuity (Tier 1 memory injection).
+    briefing_text: Optional[str] = None
+
+    # Prior prompt/result pairs from this session, replayed as chat messages so
+    # a later task knows what earlier ones did. Orchestrator-only; sub-agents
+    # stay isolated and always receive an empty ledger.
+    prior_turns: list = field(default_factory=list)
+
+    # --- Causality tracking (Phase 2: Episodic Memory) -------------------- #
+    reason: Optional[str] = None  # Why is this agent being spawned?
+    dependencies: list[str] = field(default_factory=list)  # IDs of upstream agents
+    parent_execution_id: Optional[str] = None  # Parent in execution chain
+    trace_id: Optional[str] = None  # Propagated trace across chain
+
     def __post_init__(self) -> None:
         """Initialize permission_scope and agent_name."""
         if self.permission_scope is None:
