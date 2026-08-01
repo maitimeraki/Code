@@ -340,3 +340,129 @@ def make_spawn_agent_handler(
         return json.dumps(payload)
 
     return spawn_agent
+
+
+async def memory_search(query: str, source: str = "all", limit: int = 3) -> str:
+    """Search knowledge base, error memory, and task journal.
+
+    Args:
+        query: Search query
+        source: "knowledge", "errors", "journal", or "all"
+        limit: Max results per source (clamped to 5)
+
+    Returns:
+        Formatted search results, capped at 6000 chars
+    """
+    from harness.persistence.knowledge_graph import get_knowledge_graph
+    from harness.core.error_memory import get_errors_by_type, get_top_pitfalls
+    from harness.persistence.session import SessionManager
+
+    limit = min(limit, 5)
+    results = []
+    char_count = 0
+    max_chars = 6000
+
+    try:
+        # Knowledge source
+        if source in ("knowledge", "all"):
+            kg = await get_knowledge_graph()
+            hits = await kg.search(query, top_k=limit, min_quality=0.3)
+            for hit in hits:
+                entry = f"\n[Knowledge] {hit.task_type} (quality: {hit.quality_score})\n"
+                entry += f"Solution: {(hit.solution or '')[:400]}\n"
+                if hit.code_example:
+                    entry += f"Example: {(hit.code_example or '')[:600]}\n"
+                if char_count + len(entry) <= max_chars:
+                    results.append(entry)
+                    char_count += len(entry)
+                    await kg.mark_used(hit.entry_id)
+                else:
+                    break
+
+        # Error source
+        if source in ("errors", "all") and char_count < max_chars:
+            import re
+            if re.match(r"^[A-Z]\w*(Error|Exception)$", query):
+                errors = await get_errors_by_type(query, limit)
+            else:
+                pitfalls = await get_top_pitfalls(limit=50)
+                errors = sorted(pitfalls, key=lambda x: x.get("occurrence_count", 0), reverse=True)[:limit]
+
+            for err in errors:
+                entry = f"\n[Error] {err.get('signature', 'Unknown')}\n"
+                entry += f"Context: {(err.get('context', '') or '')[:400]}\n"
+                if err.get("resolution"):
+                    entry += f"Resolution: {err.get('resolution')}\n"
+                if char_count + len(entry) <= max_chars:
+                    results.append(entry)
+                    char_count += len(entry)
+                else:
+                    break
+
+        # Journal source
+        if source in ("journal", "all") and char_count < max_chars:
+            from harness.persistence.database import get_session
+            from harness.persistence.models import TaskJournal
+            from sqlalchemy import select
+            from rank_bm25 import BM25Okapi
+
+            async with get_session() as db_session:
+                result_set = await db_session.execute(select(TaskJournal).limit(100))
+                journals = result_set.scalars().all()
+
+            if journals:
+                corpus = [j.message.lower().split() for j in journals]
+                bm25 = BM25Okapi(corpus)
+                query_tokens = query.lower().split()
+                scores = bm25.get_scores(query_tokens)
+
+                ranked = sorted(zip(journals, scores), key=lambda x: x[1], reverse=True)
+                for journal, score in ranked[:limit]:
+                    if score <= 0.0:
+                        break
+                    entry = f"\n[Journal] Task {journal.task_id}\n"
+                    entry += f"Message: {(journal.message or '')[:300]}\n"
+                    if char_count + len(entry) <= max_chars:
+                        results.append(entry)
+                        char_count += len(entry)
+                    else:
+                        break
+
+        # Tool output source — opt-in only, never part of "all"
+        if source == "tool_output":
+            from harness.persistence.database import get_session
+            from harness.persistence.models import ToolCall as ToolCallRow
+            from sqlalchemy import select
+
+            async with get_session() as db_session:
+                found = await db_session.execute(
+                    select(ToolCallRow).where(ToolCallRow.call_id == query).limit(1)
+                )
+                row = found.scalar_one_or_none()
+                if row is None:
+                    found = await db_session.execute(
+                        select(ToolCallRow)
+                        .where(ToolCallRow.tool_type.contains(query))
+                        .order_by(ToolCallRow.started_at.desc())
+                        .limit(limit)
+                    )
+                    rows = found.scalars().all()
+                else:
+                    rows = [row]
+
+            for r in rows:
+                entry = f"\n[ToolOutput] {r.tool_type} (call_id: {r.call_id})\n{r.result or ''}\n"
+                if char_count + len(entry) <= max_chars:
+                    results.append(entry)
+                    char_count += len(entry)
+                else:
+                    break
+
+    except Exception as e:
+        logger.error("Memory search failed", query=query, error=str(e))
+        return f"Search error: {str(e)}"
+
+    if not results:
+        return f"No results found for: {query}"
+
+    return "".join(results)

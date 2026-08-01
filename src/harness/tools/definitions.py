@@ -115,6 +115,13 @@ class TaskUpdateArgs(BaseModel):
     metadata: Optional[dict[str, Any]] = None
 
 
+class MemorySearchArgs(BaseModel):
+    """Arguments for memory_search tool."""
+    query: str
+    source: Literal["knowledge", "errors", "journal", "tool_output", "all"] = "all"
+    limit: int = 3
+
+
 @dataclass
 class ToolDefinition:
     """Definition of a tool for LLM tool-calling."""
@@ -833,6 +840,23 @@ Set up task dependencies:
 """,
         args_model=TaskUpdateArgs,
         permission_kind="task",
+    ),
+    ToolType.MEMORY_SEARCH: ToolDefinition(
+        name="MemorySearch",
+        tool_type=ToolType.MEMORY_SEARCH,
+        description="""Search the knowledge base for learned solutions and past errors.
+
+Query sources:
+- knowledge: Learned solutions with quality scores (call mark_used on hits)
+- errors: Error signatures and resolutions from error_memory
+- journal: Task logs and messages from prior sessions
+- all: Up to limit results from each source, labeled
+
+Returns formatted summary capped at 6000 chars with full context for each hit.
+Repeated queries within an hour are cached for free.
+""",
+        args_model=MemorySearchArgs,
+        permission_kind="fs_read",
     ),
 }
 
