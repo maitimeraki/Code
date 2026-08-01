@@ -14,6 +14,7 @@ from harness.core.verifier import resolve_verifier
 from harness.tools.definitions import get_tools_payload, validate_args, TOOL_REGISTRY
 from harness.tools.factory import build_scoped_router
 from harness.tools.executor import ToolExecutor
+from harness.tools.output_cap import cap_output
 from harness.config import get_settings
 from pydantic import ValidationError
 
@@ -85,6 +86,12 @@ date: {datetime.now().strftime('%Y-%m-%d')}
 {config.project_context.memory_text}
 </project_memory>""")
 
+    # Session briefing (Tier 1 memory) — orchestrator only
+    if config.is_orchestrator and config.briefing_text:
+        parts.append(f"""<session_briefing>
+{config.briefing_text}
+</session_briefing>""")
+
     # [5] Orchestration context — ONLY the main agent may see the roster and delegate.
     if config.is_orchestrator:
         if config.agent_registry:
@@ -131,6 +138,30 @@ def _extract_completion_summary(tool_calls) -> Optional[str]:
                     args = {}
             return args.get("summary", "") if isinstance(args, dict) else ""
     return None
+
+
+async def _persist_full_output(call_id: str, task_id: str, tool_name: str, text: str) -> None:
+    """Store an over-cap tool result so it stays retrievable via MemorySearch.
+
+    Best-effort: a DB hiccup must never break the tool call that produced it.
+    """
+    try:
+        from harness.persistence.database import get_session
+        from harness.persistence.models import ToolCall as ToolCallRow
+
+        async with get_session() as session:
+            session.add(
+                ToolCallRow(
+                    call_id=call_id,
+                    task_id=task_id or "",
+                    tool_type=tool_name,
+                    status="success",
+                    result=text,
+                )
+            )
+            await session.commit()
+    except Exception as ex:
+        logger.debug("Full tool output persistence skipped", error=str(ex))
 
 
 class AgentSpawner:
@@ -354,6 +385,7 @@ class AgentSpawner:
                     # its own tool result back to the model, so a single failure
                     # never aborts the turn: the model sees the error and adapts.
                     sem = asyncio.Semaphore(self.max_parallel_agents)
+                    task_id = config.context.get("task_id", "") if config.context else ""
 
                     async def _bounded(tc):
                         async with sem:
@@ -363,6 +395,7 @@ class AgentSpawner:
                                 agent_name=config.agent_name,
                                 agent_id=agent_id,
                                 depth=depth,
+                                task_id=task_id,
                             )
 
                     tool_outcomes = await asyncio.gather(
@@ -471,6 +504,37 @@ class AgentSpawner:
         finally:
             result.completed_at = datetime.now()
 
+            # Phase 1: Persist AgentExecution with causality tracking (episodic memory)
+            try:
+                from harness.persistence.database import get_session
+                from harness.persistence.models import AgentExecution
+
+                async with get_session() as session:
+                    execution = AgentExecution(
+                        execution_id=uuid.uuid4().hex,
+                        task_id=config.context.get("task_id") if config.context else "",
+                        agent_type=config.agent_name,
+                        status=result.status.value,
+                        output=result.output,
+                        error=result.error,
+                        tokens_used=result.tokens_used,
+                        started_at=result.started_at,
+                        completed_at=result.completed_at,
+                        # Causality tracking
+                        parent_execution_id=config.parent_execution_id,
+                        trace_id=config.trace_id or uuid.uuid4().hex,
+                        decision_context={
+                            "reason": config.reason,
+                            "dependencies": config.dependencies,
+                            "depth": depth,
+                            "iterations": result.iterations,
+                        },
+                    )
+                    session.add(execution)
+                    await session.commit()
+            except Exception as ex:
+                logger.debug("AgentExecution persistence skipped", error=str(ex))
+
             # Always emit a terminal lifecycle status with identity so the UI can
             # close this specific sub-agent's activity card (success or failure).
             if self.stream_listener:
@@ -501,6 +565,7 @@ class AgentSpawner:
         agent_name: Optional[str] = None,
         agent_id: Optional[str] = None,
         depth: int = 0,
+        task_id: str = "",
     ) -> tuple[dict, int]:
         """Execute a single tool call and return (tool_result_message, tokens_used).
 
@@ -576,10 +641,15 @@ class AgentSpawner:
                 depth=depth,
             )
 
+        raw = tool_error or (tool_result.tool_call.result if tool_result else "No result")
+        content, was_capped = cap_output(raw, tool_call.id)
+        if was_capped:
+            await _persist_full_output(tool_call.id, task_id, tool_call.name, raw)
+
         message = {
             "role": "tool",
             "tool_call_id": tool_call.id,
-            "content": tool_error or (tool_result.tool_call.result if tool_result else "No result"),
+            "content": content,
         }
         return message, tokens
 
