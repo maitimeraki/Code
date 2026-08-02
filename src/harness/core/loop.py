@@ -10,7 +10,8 @@ import structlog
 from harness.core.models import TaskState, TaskStatus, ExitCondition
 from harness.core.task_manager import TaskStateManager
 from harness.core.completion import CompletionChecker
-from harness.core.error_memory import normalize_error
+from harness.core.error_memory import normalize_error, upsert_error, find_recovery
+from harness.persistence.transient_cache import TransientMemory
 from harness.config import get_settings
 
 
@@ -23,7 +24,13 @@ class LoopController:
     def __init__(self, data_dir: Optional[Path] = None):
         if data_dir is None:
             data_dir = get_settings().get_data_dir()
-        self.task_manager = TaskStateManager(data_dir)
+
+        # Initialize transient cache (Redis) for <10ms active task lookup
+        settings = get_settings()
+        transient_memory = TransientMemory(settings.redis_url)
+
+        self.task_manager = TaskStateManager(data_dir, transient_memory=transient_memory)
+        self.transient_memory = transient_memory
         self.loop_handlers: dict[str, Callable] = {}
 
     def register_handler(self, iteration_step: str, handler: Callable) -> None:
@@ -151,14 +158,20 @@ class LoopController:
                 # record the failure so future runs learn from it.
                 # Best-effort: never let error-logging mask the original error.
                 try:
-                    from harness.core.error_memory import upsert_error
-                    await upsert_error(
+                    # Capture error signature for recovery tracking (Phase 5)
+                    error_signature = await upsert_error(
                         error_type=type(e).__name__,
                         error_message=error_msg,
                         context=f"loop:{state.task_id}",
                     )
+                    state.results["last_error_signature"] = error_signature
+                    # Phase 1: Look for known recovery solution
+                    recovery = await find_recovery(type(e).__name__, error_msg)
+                    if recovery:
+                        logger.info("Recovery found for error", recovery=recovery)
+                        state.results["last_recovery_hint"] = recovery
                 except Exception as mem_err:
-                    logger.debug("Error memory upsert skipped", error=str(mem_err))
+                    logger.debug("Error memory lookup skipped", error=str(mem_err))
 
                 await self.task_manager.save_state(state)
 
@@ -248,25 +261,58 @@ class LoopController:
         if not state:
             raise ValueError(f"No checkpoint found for task {task_id}")
 
-        # Check if task is waiting for approval; execute if approved
+        # Check if task is waiting for approval; replay tool if approved
         if state.status == TaskStatus.WAITING_APPROVAL and state.waiting_on:
             from harness.core.approval_manager import check_and_execute_once
+            from harness.persistence.database import get_session
+            from harness.persistence.models import ApprovalRequest
+            from harness.tools.executor import ToolExecutor
+            from harness.tools.router import ToolRouter
 
             approval_id = state.waiting_on
             logger.info("Task waiting for approval; checking status", task_id=task_id, approval_id=approval_id)
 
-            async def noop_executor(idempotency_key: str):
-                # Approval is for tool execution; resume loop will handle it
-                return {"status": "approved_and_ready"}
+            # Read the proposed action from DB
+            async with get_session() as db_session:
+                request = await db_session.get(ApprovalRequest, approval_id)
+                if request:
+                    proposed_action = request.proposed_action
+                else:
+                    logger.error("Approval request not found", approval_id=approval_id)
+                    state.status = TaskStatus.FAILED
+                    await self.task_manager.save_state(state)
+                    return state
 
-            success, result, error = await check_and_execute_once(approval_id, noop_executor)
+            # Create executor and execute the parked tool
+            async def replay_tool(idempotency_key: str):
+                router = ToolRouter()
+                executor = ToolExecutor(router, task_id=task_id)
+                tool_type = proposed_action.get("tool_type")
+                args = proposed_action.get("args", {})
+                if not tool_type:
+                    raise ValueError("Proposed action has no tool_type")
+                from harness.tools.models import ToolType
+                result = await executor.execute(ToolType(tool_type), **args)
+                return result.tool_call.result or {}
+
+            success, result, error = await check_and_execute_once(approval_id, replay_tool)
             if not success:
-                logger.warning("Approval still pending or rejected", approval_id=approval_id, error=error)
-                state.status = TaskStatus.PAUSED
-                await self.task_manager.save_state(state)
-                return state
+                # Approval rejected or still pending — inject rejection reason into state
+                if "rejected" in error.lower():
+                    state.messages.append({
+                        "role": "system",
+                        "content": f"Tool approval was rejected: {error}. Please revise your approach."
+                    })
+                else:
+                    logger.warning("Approval still pending", approval_id=approval_id, error=error)
+                    state.status = TaskStatus.PAUSED
+                    await self.task_manager.save_state(state)
+                    return state
+            else:
+                # Clear waiting_on on success
+                state.waiting_on = None
 
-            logger.info("Approval granted; resuming execution", approval_id=approval_id)
+            logger.info("Approval granted and tool executed", approval_id=approval_id)
 
         state.status = TaskStatus.RUNNING
         logger.info("Resuming task", task_id=task_id, from_iteration=state.iteration)

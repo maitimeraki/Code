@@ -21,20 +21,22 @@ logger = structlog.get_logger(__name__)
 class TaskStateManager:
     """Manage task state with file-based persistence."""
 
-    def __init__(self, data_dir: Path = Path("data")):
+    def __init__(self, data_dir: Path = Path("data"), transient_memory=None):
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(exist_ok=True)
         self.journal_dir = self.data_dir / "journals"
         self.journal_dir.mkdir(exist_ok=True)
+        self.transient_memory = transient_memory
 
     def _get_journal_path(self, task_id: str) -> Path:
         """Get path for task's journal file."""
         return self.journal_dir / f"{task_id}.msgpack"
 
     async def save_state(self, state: TaskState) -> None:
-        """Persist task state: SQLite (authoritative) + msgpack (cache).
+        """Persist task state: SQLite (authoritative) + msgpack (cache) + Redis (transient).
 
         DB is truth. Msgpack is optional fast-cache for offline access.
+        Redis provides <10ms lookup during active execution.
         """
         # Write to SQLite (authoritative)
         async with get_session() as session:
@@ -44,8 +46,8 @@ class TaskStateManager:
                 task_record = Task(task_id=state.task_id)
                 session.add(task_record)
 
-            # Update all fields
-            task_record.session_id = state.task_id
+            # Update all fields including phase tracking
+            task_record.session_id = state.results.get("session_id") or task_record.session_id
             task_record.description = state.description
             task_record.status = state.status.value
             task_record.result = state.result
@@ -55,6 +57,11 @@ class TaskStateManager:
             task_record.tokens_used = state.tokens_used
             task_record.started_at = state.started_at
             task_record.completed_at = state.completed_at
+
+            # Phase tracking (working memory)
+            task_record.phase = getattr(state, 'phase', 'planning')
+            task_record.decision_log = getattr(state, 'decision_log', [])
+
             task_record.metadata_json = {
                 "results": state.results,
                 "errors": state.errors,
@@ -81,10 +88,25 @@ class TaskStateManager:
         data = msgpack.packb(checkpoint.__dict__, use_bin_type=True)
         await asyncio.to_thread(journal_path.write_bytes, data)
 
+        # Sync to transient cache (Redis) for <10ms lookup during execution
+        if self.transient_memory:
+            context = {
+                "task_id": state.task_id,
+                "phase": getattr(state, 'phase', 'planning'),
+                "iteration": state.iteration,
+                "status": state.status.value,
+                "tokens_used": state.tokens_used,
+                "last_update": datetime.now().isoformat()
+            }
+            await self.transient_memory.set_context(state.task_id, context)
+
         logger.info("Saved task state", task_id=state.task_id, iteration=state.iteration)
 
     async def load_state(self, task_id: str) -> Optional[TaskState]:
-        """Restore task state from SQLite (authoritative source)."""
+        """Restore task state from SQLite (authoritative source).
+
+        Also warms transient cache for active tasks.
+        """
         async with get_session() as session:
             task_record = await session.get(Task, task_id)
 
@@ -111,6 +133,23 @@ class TaskStateManager:
                 started_at=task_record.started_at,
                 completed_at=task_record.completed_at,
             )
+
+            # Restore phase tracking if available
+            if hasattr(state, '__dict__'):
+                state.phase = getattr(task_record, 'phase', 'planning')
+                state.decision_log = getattr(task_record, 'decision_log', [])
+
+            # Warm transient cache for active tasks
+            if self.transient_memory and task_record.status in ["running", "pending"]:
+                context = {
+                    "task_id": task_record.task_id,
+                    "phase": getattr(task_record, 'phase', 'planning'),
+                    "iteration": task_record.iterations,
+                    "status": task_record.status,
+                    "tokens_used": task_record.tokens_used,
+                    "last_update": datetime.now().isoformat()
+                }
+                await self.transient_memory.set_context(task_id, context)
 
             logger.info("Loaded task state", task_id=task_id, iteration=state.iteration)
             return state
