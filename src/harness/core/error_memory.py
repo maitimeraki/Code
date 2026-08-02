@@ -165,3 +165,75 @@ async def clear_error(signature: str) -> bool:
 
     logger.info("Error cleared from memory", signature=signature)
     return True
+
+
+async def suggest_recovery(
+    signature: str,
+    proposed_solution: str,
+) -> bool:
+    """Store a recovery solution for a known error.
+
+    Args:
+        signature: The error signature
+        proposed_solution: How to fix/recover from this error
+
+    Returns:
+        True if updated, False if signature not found
+    """
+    async with get_session() as db_session:
+        entry = await db_session.get(ErrorMemory, signature)
+        if not entry:
+            logger.warning("Error signature not found", signature=signature)
+            return False
+
+        entry.resolution = proposed_solution
+        entry.root_cause = proposed_solution.split("\n")[0]
+        await db_session.commit()
+
+        logger.info("Recovery suggested for error", signature=signature)
+        return True
+
+
+async def find_recovery(error_type: str, error_message: str) -> Optional[str]:
+    """Find a known recovery solution for this error.
+
+    Args:
+        error_type: Exception class name
+        error_message: Exception message
+
+    Returns:
+        Recovery solution if found, None otherwise
+    """
+    signature = _error_signature(error_type, error_message)
+
+    async with get_session() as db_session:
+        entry = await db_session.get(ErrorMemory, signature)
+        if entry and entry.resolution:
+            logger.info("Recovery found", signature=signature)
+            return entry.resolution
+
+    return None
+
+
+async def get_causality_chain(task_id: str, trace_id: str) -> list:
+    """Get execution chain for a trace_id (causality debugging).
+
+    Args:
+        task_id: Task ID
+        trace_id: Trace ID to follow through execution chain
+
+    Returns:
+        List of AgentExecution records ordered by creation time
+    """
+    from harness.persistence.models import AgentExecution
+
+    async with get_session() as db_session:
+        result = await db_session.execute(
+            select(AgentExecution)
+            .where(
+                (AgentExecution.trace_id == trace_id)
+                & (AgentExecution.task_id == task_id)
+            )
+            .order_by(AgentExecution.started_at.asc())
+        )
+        return result.scalars().all()

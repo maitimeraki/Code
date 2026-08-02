@@ -105,8 +105,8 @@ async def apply_decision(
             logger.warning("Approval request not found", approval_id=approval_id)
             return False
 
-        if decision.lower() not in ["approved", "rejected"]:
-            raise ValueError(f"Invalid decision: {decision}. Must be 'approved' or 'rejected'")
+        if decision.lower() not in ["approved", "rejected", "timed_out"]:
+            raise ValueError(f"Invalid decision: {decision}. Must be 'approved', 'rejected', or 'timed_out'")
 
         request.status = decision.lower()
         request.decided_at = datetime.now()
@@ -142,16 +142,30 @@ async def check_and_execute_once(
 
     Returns:
         (success: bool, result: Any, error: Optional[str])
+        - success=True means approval is approved and either executed or was already executed
+        - success=False means approval is pending/rejected (caller distinguishes via error string)
     """
+    task_id = None
+    idempotency_key = None
+    request_status = None
+
     async with get_session() as db_session:
         request = await db_session.get(ApprovalRequest, approval_id)
         if not request:
             return (False, None, f"Approval not found: {approval_id}")
 
-        if request.status != "approved":
-            return (False, None, f"Approval not approved: {request.status}")
-
+        # Capture task_id and status inside session block (bug #3 fix)
+        task_id = request.task_id
+        request_status = request.status
         idempotency_key = request.idempotency_key
+
+        # Distinguish pending from rejected (bug #1 fix)
+        if request_status == "pending":
+            return (False, None, "Approval still pending")
+        elif request_status == "rejected":
+            return (False, None, f"Approval rejected: {request.decision_notes or 'no reason given'}")
+        elif request_status != "approved":
+            return (False, None, f"Approval not approved: {request_status}")
 
         # Check if already executed
         executed = await db_session.get(ExecutedAction, idempotency_key)
@@ -161,7 +175,10 @@ async def check_and_execute_once(
                 idempotency_key=idempotency_key,
                 approval_id=approval_id,
             )
-            return (True, executed.result_json, executed.error)
+            # Bug #2 fix: only return success=True if no error, or if error, return as (False, ...)
+            if executed.error:
+                return (False, executed.result_json, executed.error)
+            return (True, executed.result_json, None)
 
     # Execute the tool
     try:
@@ -171,7 +188,7 @@ async def check_and_execute_once(
         async with get_session() as db_session:
             executed_action = ExecutedAction(
                 idempotency_key=idempotency_key,
-                task_id=request.task_id,
+                task_id=task_id,
                 result_json=result if isinstance(result, dict) else {"result": str(result)},
                 executed_at=datetime.now(),
             )
@@ -192,7 +209,7 @@ async def check_and_execute_once(
         async with get_session() as db_session:
             executed_action = ExecutedAction(
                 idempotency_key=idempotency_key,
-                task_id=request.task_id,
+                task_id=task_id,
                 error=error_msg,
                 executed_at=datetime.now(),
             )
