@@ -103,6 +103,7 @@ class LLMSettings(BaseModel):
 
 class Settings(BaseSettings):
     """Application configuration from environment variables."""
+    user_id: str = Field(default="", alias="USER_ID")
 
     # LLM Providers
     code_api_key: str = Field(default="", alias="CODE_API_KEY")
@@ -127,6 +128,14 @@ class Settings(BaseSettings):
         default=0, alias="ASK_QUESTION_TIMEOUT_SECONDS",
         description="Auto-continue timeout for AskUserQuestion. "
                     "0=forever, 60=1min, 300=5min, 600=10min"
+    )
+    approval_timeout_seconds: int = Field(
+        default=0, alias="APPROVAL_TIMEOUT_SECONDS",
+        description="Seconds before an unanswered approval auto-resolves. 0 = wait forever."
+    )
+    approval_timeout_action: str = Field(
+        default="deny", alias="APPROVAL_TIMEOUT_ACTION",
+        description="Action on timeout: 'deny' or 'approve' (high-risk always waits)."
     )
 
     # Completion / loop guards (opt-in; autonomous defaults unchanged)

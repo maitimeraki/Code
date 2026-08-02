@@ -92,6 +92,28 @@ def _parse_command_args(args: list[str]) -> Optional[dict]:
         if query:
             return {"command": "knowledge-search", "query": query, "limit": limit}
 
+    elif command == "approvals":
+        task_id = None
+        for i, arg in enumerate(args[1:], 1):
+            if arg in {"--task-id", "-id"} and i < len(args) - 1:
+                task_id = args[i + 1]
+        return {"command": "approvals", "task_id": task_id}
+
+    elif command == "approve":
+        approval_id = args[1] if len(args) > 1 else None
+        decision = "approved"
+        reason = None
+        i = 2
+        while i < len(args):
+            if args[i] == "--reject":
+                decision = "rejected"
+            elif args[i] == "--reason" and i + 1 < len(args):
+                reason = " ".join(args[i + 1:])
+                break
+            i += 1
+        if approval_id:
+            return {"command": "approve", "approval_id": approval_id, "decision": decision, "reason": reason}
+
     return None
 
 
@@ -216,6 +238,83 @@ def knowledge_search(
 
     # Phase 5 hook: Will query knowledge graph
     console.print("[yellow]Not yet implemented - awaiting Phase 5 (Knowledge Graph)[/yellow]")
+
+
+@app.command()
+def approvals(
+    task_id: Optional[str] = typer.Option(None, "--task-id", "-id", help="Filter by task ID"),
+) -> None:
+    """List pending approval requests."""
+    settings = get_settings()
+    configure_logging(settings.log_level)
+
+    async def async_approvals():
+        from harness.persistence.database import init_db
+        from harness.core.approval_manager import get_pending_approvals
+        from harness.persistence.models import ApprovalRequest
+        from sqlalchemy import select
+        from harness.persistence.database import get_session
+
+        await init_db()
+
+        console.print("[bold]Pending Approvals:[/bold]")
+
+        if task_id:
+            # Get approvals for specific task
+            pending = await get_pending_approvals(task_id)
+            if not pending:
+                console.print(f"  No pending approvals for task {task_id}")
+                return
+            for req in pending:
+                console.print(f"  {req.approval_id[:8]}... - {req.summary}")
+                console.print(f"    Risk: {req.risk_level}, Created: {req.created_at}")
+        else:
+            # Get all pending approvals
+            async with get_session() as db_session:
+                result = await db_session.execute(
+                    select(ApprovalRequest).where(ApprovalRequest.status == "pending")
+                )
+                pending = result.scalars().all()
+            if not pending:
+                console.print("  (none)")
+                return
+            for req in pending:
+                console.print(f"  {req.approval_id[:8]}... - Task {req.task_id[:8]}... - {req.summary}")
+                console.print(f"    Risk: {req.risk_level}, Created: {req.created_at}")
+
+    asyncio.run(async_approvals())
+
+
+@app.command()
+def approve(
+    approval_id: str = typer.Argument(..., help="Approval ID"),
+    reject: bool = typer.Option(False, "--reject", help="Reject instead of approve"),
+    reason: Optional[str] = typer.Option(None, "--reason", help="Reason for decision"),
+) -> None:
+    """Approve or reject a pending approval request."""
+    settings = get_settings()
+    configure_logging(settings.log_level)
+
+    async def async_approve():
+        from harness.persistence.database import init_db
+        from harness.core.approval_manager import apply_decision
+
+        await init_db()
+
+        decision = "rejected" if reject else "approved"
+        notes = reason or ""
+
+        success = await apply_decision(approval_id, decision, decided_by="cli", notes=notes)
+
+        if success:
+            console.print(f"[bold green]✓ Approval decision recorded:[/bold green] {decision}")
+            if reason:
+                console.print(f"  Reason: {reason}")
+        else:
+            console.print(f"[bold red]✗ Failed to record decision[/bold red]")
+            console.print(f"  Approval ID not found: {approval_id}")
+
+    asyncio.run(async_approve())
 
 
 @app.command()

@@ -1,7 +1,7 @@
 """Interactive Terminal UI application (Claude Code style)."""
 
 import asyncio
-from typing import Optional
+from typing import Optional, Any
 
 from harness.config import get_settings, export_env_from_settings, get_app_settings
 from harness.logging import configure_logging, get_logger
@@ -38,17 +38,35 @@ class HarnessApp:
         from harness.persistence.database import init_db
         await init_db()
 
+        # Create the session row + build the briefing (Tier 1 memory)
+        await self.orchestrator.ensure_session()
+
+        # Phase 1: Initialize transient cache (Redis) for <10ms active task lookup
+        # Best-effort: system works without Redis (graceful degradation)
+        try:
+            from harness.persistence.transient_cache import TransientMemory
+            transient_memory = TransientMemory(self.settings.redis_url)
+            await transient_memory.connect()
+            logger.info("Transient cache initialized")
+        except Exception as e:
+            logger.info("Transient cache skipped", error=str(e))
+
         # If auto_command provided, execute it concurrently with UI
-        if self.auto_command:
-            # Run UI and auto-command concurrently
-            await asyncio.gather(
-                self.ui.run(),
-                self._execute_auto_command_with_delay(),
-                return_exceptions=True
-            )
-        else:
-            # Just run UI
-            await self.ui.run()
+        try:
+            if self.auto_command:
+                # Run UI and auto-command concurrently
+                await asyncio.gather(
+                    self.ui.run(),
+                    self._execute_auto_command_with_delay(),
+                    return_exceptions=True
+                )
+            else:
+                # Just run UI
+                await self.ui.run()
+        finally:
+            # Pause session on exit (normal or crashed)
+            if self.orchestrator.session_id:
+                await self.orchestrator._session_manager.pause_session(self.orchestrator.session_id)
 
     async def _execute_auto_command_with_delay(self) -> None:
         """Execute auto-command after UI initializes."""
@@ -79,6 +97,16 @@ class HarnessApp:
                 query = self.auto_command.get("query")
                 limit = self.auto_command.get("limit", 5)
                 await self._search_knowledge(query, limit)
+
+            elif cmd == "approvals":
+                task_id = self.auto_command.get("task_id")
+                await self._list_approvals(task_id)
+
+            elif cmd == "approve":
+                approval_id = self.auto_command.get("approval_id")
+                decision = self.auto_command.get("decision", "approved")
+                reason = self.auto_command.get("reason")
+                await self._apply_approval(approval_id, decision, reason)
 
         except Exception as e:
             self.ui.add_message(f"Error executing command: {str(e)}", level="error")
@@ -129,6 +157,50 @@ class HarnessApp:
         """Search knowledge graph."""
         self.ui.add_message(f"Searching: {query}")
         self.ui.add_message("Not yet implemented - awaiting Phase 5 (Knowledge Graph)", level="info")
+
+    async def _list_approvals(self, task_id: Optional[str] = None) -> None:
+        """List pending approval requests."""
+        from harness.core.approval_manager import get_pending_approvals
+        from harness.persistence.models import ApprovalRequest
+        from sqlalchemy import select
+        from harness.persistence.database import get_session
+
+        self.ui.add_message("Pending Approvals:")
+
+        if task_id:
+            pending = await get_pending_approvals(task_id)
+            if not pending:
+                self.ui.add_message(f"  No pending approvals for task {task_id}")
+                return
+            for req in pending:
+                self.ui.add_message(f"  {req.approval_id[:8]}... - {req.summary}")
+                self.ui.add_message(f"    Risk: {req.risk_level}, Created: {req.created_at}")
+        else:
+            async with get_session() as db_session:
+                result = await db_session.execute(
+                    select(ApprovalRequest).where(ApprovalRequest.status == "pending")
+                )
+                pending = result.scalars().all()
+            if not pending:
+                self.ui.add_message("  (none)")
+                return
+            for req in pending:
+                self.ui.add_message(f"  {req.approval_id[:8]}... - Task {req.task_id[:8]}... - {req.summary}")
+                self.ui.add_message(f"    Risk: {req.risk_level}, Created: {req.created_at}")
+
+    async def _apply_approval(self, approval_id: str, decision: str, reason: Optional[str] = None) -> None:
+        """Apply approval decision."""
+        from harness.core.approval_manager import apply_decision
+
+        notes = reason or ""
+        success = await apply_decision(approval_id, decision, decided_by="cli", notes=notes)
+
+        if success:
+            self.ui.add_message(f"✓ Approval decision recorded: {decision}", level="success")
+            if reason:
+                self.ui.add_message(f"  Reason: {reason}")
+        else:
+            self.ui.add_message(f"✗ Failed to record decision: {approval_id} not found", level="error")
 
     async def _create_and_run_task(self, task_description: str) -> None:
         """Create and run a task through orchestration."""
