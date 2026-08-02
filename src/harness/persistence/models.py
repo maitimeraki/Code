@@ -2,7 +2,7 @@
 
 from datetime import datetime
 from typing import Optional, Dict, Any
-from sqlalchemy import Column, String, Integer, Float, DateTime, Text, Boolean, JSON
+from sqlalchemy import Column, String, Integer, Float, DateTime, Text, Boolean, JSON, Index
 from sqlalchemy.orm import declarative_base
 
 Base = declarative_base()
@@ -38,10 +38,20 @@ class Task(Base):
     tokens_used = Column(Integer, default=0)
 
     created_at = Column(DateTime, default=datetime.now, index=True)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
     started_at = Column(DateTime, nullable=True)
     completed_at = Column(DateTime, nullable=True)
 
+    # Phase tracking for episodic memory
+    phase = Column(String(50), default="planning", index=True)  # planning, executing, completing
+    decision_log = Column(JSON, default=[])  # [{decision, timestamp}, ...]
+    context_hash = Column(String(64), nullable=True)  # Hash of execution context for resume
+
     metadata_json = Column(JSON, default={})
+
+    __table_args__ = (
+        Index('ix_task_phase_status', 'phase', 'status'),
+    )
 
 
 class AgentExecution(Base):
@@ -60,7 +70,17 @@ class AgentExecution(Base):
     completed_at = Column(DateTime, nullable=True)
     duration_seconds = Column(Float, nullable=True)
 
+    # Causality tracking for episodic memory
+    parent_execution_id = Column(String(36), nullable=True, index=True)  # Parent in execution chain
+    trace_id = Column(String(36), nullable=False, index=True)  # Propagated trace across chain
+    decision_context = Column(JSON, default={})  # {reason, dependencies, timestamp}
+
     metadata_json = Column(JSON, default={})
+
+    __table_args__ = (
+        Index('ix_agentexec_trace', 'trace_id', 'started_at'),
+        Index('ix_agentexec_task_parent', 'task_id', 'parent_execution_id'),
+    )
 
 
 class ToolCall(Base):
@@ -82,6 +102,10 @@ class ToolCall(Base):
     duration_seconds = Column(Float, nullable=True)
 
     metadata_json = Column(JSON, default={})
+
+    __table_args__ = (
+        Index('ix_toolcall_task_time', 'task_id', 'started_at'),
+    )
 
 
 class KnowledgeEntry(Base):
