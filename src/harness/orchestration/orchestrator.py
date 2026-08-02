@@ -57,8 +57,8 @@ class HarnessOrchestrator:
             max_parallel_agents=settings.max_parallel_agents,
             tool_timeout_seconds=settings.tool_timeout_seconds,
             stream_listener=self.stream_listener,
-            approval_callback=ui.request_approval if ui else None,
-            ask_user_question_callback=ui.ask_user_question_callback if ui else None,
+            approval_callback=self.ui.request_approval if self.ui else None,
+            ask_user_question_callback=self.ui.ask_user_question_callback if self.ui else None,
         )
 
         # Session management and briefing
@@ -237,7 +237,9 @@ class HarnessOrchestrator:
                 error_sig = state.results.get("last_error_signature")
                 if error_sig and not state.results.get("last_recovery_hint"):
                     # Only record newly solved errors (not re-runs of known solutions)
-                    from harness.core.error_memory import suggest_recovery, add_solution
+                    from harness.core.error_memory import suggest_recovery
+                    from harness.persistence.knowledge_graph import KnowledgeGraph
+                    add_solution = KnowledgeGraph().add_solution
                     await suggest_recovery(error_sig, result.output[:1000])
                     state.results["last_error_signature"] = None
 

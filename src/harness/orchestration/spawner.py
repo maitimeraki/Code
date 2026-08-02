@@ -250,6 +250,7 @@ class AgentSpawner:
                 router,
                 tool_timeout_seconds=self.tool_timeout_seconds,
                 approval_callback=self.approval_callback,
+                task_id=config.task_id if hasattr(config, 'task_id') else None,
             )
 
             # Build tools payload for LLM (normalize empty → None so we never send tools=[])
