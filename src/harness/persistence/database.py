@@ -45,39 +45,47 @@ async def init_db():
         return
 
     settings = get_settings()
+    
+    try:
+        # Create async engine
+        if settings.database_url.startswith("sqlite"):
+            # SQLite-specific: StaticPool to avoid concurrency issues
+            _engine = create_async_engine(
+                settings.database_url,
+                echo=False,
+                poolclass=StaticPool,
+                connect_args={"timeout": 5.0, "check_same_thread": False},
+            )
+        else:
+            # PostgreSQL or other
+            _engine = create_async_engine(settings.database_url, echo=False)
 
-    # Create async engine
-    if settings.database_url.startswith("sqlite"):
-        # SQLite-specific: StaticPool to avoid concurrency issues
-        _engine = create_async_engine(
-            settings.database_url,
-            echo=False,
-            poolclass=StaticPool,
-            connect_args={"timeout": 5.0, "check_same_thread": False},
+        # Attach pragma setup to every new connection (SQLite only)
+        if settings.database_url.startswith("sqlite"):
+            @event.listens_for(_engine.sync_engine, "connect")
+            def receive_connect(dbapi_conn, connection_record):
+                _sqlite_pragma_setup(dbapi_conn, connection_record)
+
+        # Create async session maker
+        _async_session_maker = async_sessionmaker(
+            _engine,
+            class_=AsyncSession,
+            expire_on_commit=False,
+            autoflush=False,
         )
-    else:
-        # PostgreSQL or other
-        _engine = create_async_engine(settings.database_url, echo=False)
 
-    # Attach pragma setup to every new connection (SQLite only)
-    if settings.database_url.startswith("sqlite"):
-        @event.listens_for(_engine.sync_engine, "connect")
-        def receive_connect(dbapi_conn, connection_record):
-            _sqlite_pragma_setup(dbapi_conn, connection_record)
+        # Create all tables
+        async with _engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
 
-    # Create async session maker
-    _async_session_maker = async_sessionmaker(
-        _engine,
-        class_=AsyncSession,
-        expire_on_commit=False,
-        autoflush=False,
-    )
+        # Apply schema migrations (Phase 1: add working + episodic memory columns)
+        async with _async_session_maker() as session:
+            from harness.persistence.migrations import apply_migrations
+            await apply_migrations(session)
 
-    # Create all tables
-    async with _engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-
-    logger.info(f"Database initialized: {settings.database_url}")
+        logger.info(f"Database initialized: {settings.database_url}")
+    except ConnectionError as e:
+        logger.error(f"Database initialized error wwith messages {e}")
 
 
 @asynccontextmanager
@@ -92,7 +100,11 @@ async def get_session():
         raise RuntimeError("Database not initialized. Call init_db() first.")
 
     async with _async_session_maker() as session:
-        yield session
+        try:
+            yield session
+        except Exception:
+            await session.rollback()
+            raise
 
 
 async def get_engine():

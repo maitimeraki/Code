@@ -3,6 +3,7 @@
 from typing import List, Optional, Dict, Any
 from datetime import datetime
 from uuid import uuid4
+import asyncio
 import structlog
 from sqlalchemy import select
 from rank_bm25 import BM25Okapi
@@ -71,15 +72,13 @@ class KnowledgeGraph:
             self.bm25_index = None
             return
 
-        # Tokenize documents
+        # Tokenize documents (order preserved via dict iteration)
         corpus = [
             f"{entry.task_type} {entry.solution}".lower().split()
             for entry in self._cache.values()
         ]
-        entry_ids = list(self._cache.keys())
 
         self.bm25_index = BM25Okapi(corpus)
-        self._entry_order = entry_ids  # Track order for scoring
         logger.debug(f"Rebuilt knowledge graph with {len(self._cache)} entries")
 
     async def search(
@@ -100,18 +99,14 @@ class KnowledgeGraph:
         # Get BM25 scores
         scores = self.bm25_index.get_scores(query_tokens)
 
-        # Rank entries
-        ranked = []
-        for idx, (entry_id, entry) in enumerate(self._cache.items()):
-            score = scores[self._entry_order.index(entry_id)]
-            ranked.append((entry, score))
-
+        # Rank entries (zip preserves dict order)
+        ranked = [(entry, score) for entry, score in zip(self._cache.values(), scores)]
         ranked.sort(key=lambda x: x[1], reverse=True)
 
         # Filter and limit
         results = []
         for entry, score in ranked:
-            if score < 0:
+            if score <= 0.0:
                 continue
             if entry.quality_score < min_quality:
                 continue
@@ -160,3 +155,33 @@ class KnowledgeGraph:
             for entry in self._cache.values()
             if entry.task_type == task_type
         ]
+
+
+# Module-level singleton for knowledge graph (avoids per-spawn full-table-load)
+_kg: Optional[KnowledgeGraph] = None
+_kg_lock = asyncio.Lock()
+
+
+async def get_knowledge_graph() -> KnowledgeGraph:
+    """Get or create the process-level knowledge graph singleton.
+
+    Double-checked locking ensures concurrent spawns trigger only one init().
+    """
+    global _kg
+
+    # Fast path: already initialized
+    if _kg is not None:
+        return _kg
+
+    # Slow path: initialize under lock
+    async with _kg_lock:
+        if _kg is None:
+            _kg = KnowledgeGraph()
+            await _kg.init()
+        return _kg
+
+
+def dispose_kg() -> None:
+    """Reset the knowledge graph singleton (for testing)."""
+    global _kg
+    _kg = None
