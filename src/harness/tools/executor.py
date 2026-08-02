@@ -21,12 +21,14 @@ class ToolExecutor:
         router: ToolRouter,
         tool_timeout_seconds: Optional[int] = None,
         approval_callback: Optional[Callable[[ToolType, Dict[str, Any], str], Any]] = None,
+        task_id: Optional[str] = None,
     ):
         self.router = router
         self.cache: Dict[str, tuple[Any, datetime]] = {}
         self.cache_ttl = timedelta(hours=1)
         self.tool_timeout_seconds = tool_timeout_seconds or get_settings().tool_timeout_seconds
         self.approval_callback = approval_callback
+        self.task_id = task_id
         self.retry_config = {
             ToolType.READ: {"max_retries": 2, "backoff": 0.5},
             ToolType.WRITE: {"max_retries": 1, "backoff": 1.0},
@@ -45,6 +47,16 @@ class ToolExecutor:
         key_str = f"{tool_type.value}:{str(sorted(kwargs.items()))}"
         return hashlib.md5(key_str.encode()).hexdigest()
 
+    def _fingerprint_for_approval(self, tool_type: ToolType, kwargs: Dict[str, Any]) -> str:
+        """Generate a fingerprint for approval matching (tool+arg combo)."""
+        from harness.core.approval_policy import fingerprint_bash, fingerprint_file
+        if tool_type == ToolType.BASH:
+            return fingerprint_bash(kwargs.get("command", ""))
+        elif tool_type in (ToolType.WRITE, ToolType.EDIT, ToolType.READ):
+            return fingerprint_file(kwargs.get("path", ""))
+        else:
+            return ""
+
     def _is_cached_valid(self, cached_time: datetime) -> bool:
         """Check if cached result is still valid."""
         return datetime.now() - cached_time < self.cache_ttl
@@ -55,62 +67,37 @@ class ToolExecutor:
         **kwargs
     ) -> ToolResult:
         """Execute tool with retry and caching."""
-        # Opt-in HITL gate: when require_approval is on, ask for high-risk actions
-        # (rm -rf, git push, DB drops). If callback set → await user decision (inline).
-        # If no callback → fail-safe block (no human reachable). Autonomous default
-        # (flag off) is unchanged. Fail-open: a classifier hiccup never blocks.
+        # HITL gate: check if approval is needed (via permissions or risk classification).
+        # If needed and not yet granted, return AWAITING_APPROVAL; the loop will park.
         # AskUserQuestion is exempt — it IS the user interaction mechanism.
-        if tool_type == ToolType.ASK_USER_QUESTION:
-            pass  # skip approval, this tool IS the user interaction
-        elif get_settings().require_approval:
+        if tool_type != ToolType.ASK_USER_QUESTION and get_settings().require_approval:
+            needs_approval = False
             try:
                 from harness.core.risk import classify_risk
-                risk = classify_risk(tool_type, kwargs)
-            except Exception:
-                risk = "low"
-            if risk == "high":
-                if self.approval_callback:
-                    # Ask human via UI callback; await decision
-                    try:
-                        approved = await self.approval_callback(tool_type, kwargs, risk)
-                        if not approved:
-                            logger.warning(f"Denied high-risk {tool_type.value} (user rejected)")
-                            return ToolResult(
-                                tool_call=ToolCall(
-                                    tool_type=tool_type,
-                                    args=kwargs,
-                                    status=ToolStatus.FAILED,
-                                    error=(
-                                        "User denied approval for this high-risk action. "
-                                        "Explain why it is needed if you wish to proceed."
-                                    ),
-                                )
-                            )
-                        # approved=True: fall through and execute
-                    except Exception as e:
-                        logger.error(f"Approval callback failed: {e}")
-                        # Fail-safe: block on callback error
-                        return ToolResult(
-                            tool_call=ToolCall(
-                                tool_type=tool_type,
-                                args=kwargs,
-                                status=ToolStatus.FAILED,
-                                error=f"Approval callback error: {e}",
-                            )
-                        )
-                else:
-                    # No callback set → fail-safe block
-                    logger.warning(f"Blocked high-risk {tool_type.value} (no approval_callback set)")
+                from harness.tools.permissions import PermissionScope
+
+                risk = classify_risk(tool_type, kwargs, scope=None)
+                needs_approval = risk == "high"
+            except Exception as e:
+                logger.error(f"Risk classification failed: {e}")
+                needs_approval = True
+
+            if needs_approval:
+                # Check if already granted (session or persisted)
+                from harness.core.approval_policy import is_granted_session
+                fingerprint = self._fingerprint_for_approval(tool_type, kwargs)
+
+                if not is_granted_session(tool_type.value, fingerprint):
+                    # Not granted — return AWAITING_APPROVAL for the loop to park
+                    logger.info(
+                        "Tool requires approval, returning AWAITING_APPROVAL",
+                        tool_type=tool_type.value,
+                    )
                     return ToolResult(
                         tool_call=ToolCall(
                             tool_type=tool_type,
                             args=kwargs,
-                            status=ToolStatus.FAILED,
-                            error=(
-                                "Blocked: this action is high-risk and requires human approval "
-                                "(REQUIRE_APPROVAL is enabled). Do not retry; explain what you "
-                                "intended and why it is needed."
-                            ),
+                            status=ToolStatus.AWAITING_APPROVAL,
                         )
                     )
 

@@ -88,18 +88,20 @@ class PermissionScope:
         - "requires_approval": allowed but needs user approval
         - PermissionError: denied (caller should raise)
         """
+        perm = self.tools.get(tool)
+
+        # Deny is absolute (checked before always_ask)
+        if perm and perm.mode == "deny":
+            return False, None
+
         # Always-ask tools require approval
         if tool in self.always_ask:
             return True, "requires_approval"
 
-        perm = self.tools.get(tool)
         if not perm:
             if self.default_mode == "strict":
                 return False, None
             return True, None
-
-        if perm.mode == "deny":
-            return False, None
 
         if perm.mode == "ask":
             if self._matches_patterns(resource, perm.patterns):

@@ -8,6 +8,21 @@ from .permissions import PermissionScope, PathGuard, CommandGuard
 from . import handlers
 
 
+def _gate(scope: PermissionScope, tool_name: str, resource: str = "") -> bool:
+    """Check if tool is allowed and return whether approval is needed.
+
+    Returns:
+        True if tool requires approval, False if allowed without approval.
+
+    Raises:
+        PermissionError: If tool is denied.
+    """
+    allowed, mode = scope.check(tool_name, resource)
+    if not allowed:
+        raise PermissionError(f"{tool_name} is not allowed in this scope")
+    return mode == "requires_approval"
+
+
 
 def build_scoped_router(
     scope: PermissionScope,
@@ -36,9 +51,7 @@ def build_scoped_router(
 
     # READ — file read with tool permission check + path guard
     async def read_file_guarded(**kwargs: Any) -> str:
-        allowed, mode = scope.check("Read", kwargs.get("path", ""))
-        if not allowed:
-            raise PermissionError("Read access is not allowed in this scope")
+        _gate(scope, "Read", kwargs.get("path", ""))
         path = kwargs.get("path")
         if path:
             PathGuard.resolve_and_check(path, scope, "read")
@@ -48,9 +61,7 @@ def build_scoped_router(
 
     # WRITE — file write with tool permission check + path guard
     async def write_file_guarded(**kwargs: Any) -> str:
-        allowed, mode = scope.check("Write", kwargs.get("path", ""))
-        if not allowed:
-            raise PermissionError("Write access is not allowed in this scope")
+        _gate(scope, "Write", kwargs.get("path", ""))
         path = kwargs.get("path")
         if path:
             PathGuard.resolve_and_check(path, scope, "write")
@@ -60,9 +71,7 @@ def build_scoped_router(
 
     # EDIT — file edit with tool permission check + path guard
     async def edit_file_guarded(**kwargs: Any) -> str:
-        allowed, mode = scope.check("Edit", kwargs.get("path", ""))
-        if not allowed:
-            raise PermissionError("Edit access is not allowed in this scope")
+        _gate(scope, "Edit", kwargs.get("path", ""))
         path = kwargs.get("path")
         if path:
             PathGuard.resolve_and_check(path, scope, "write")
@@ -73,9 +82,7 @@ def build_scoped_router(
     # BASH — shell execution with tool permission check + command guard
     async def bash_exec_guarded(**kwargs: Any) -> str:
         command = kwargs.get("command", "")
-        allowed, mode = scope.check("Bash", command)
-        if not allowed:
-            raise PermissionError("Bash execution is not allowed in this scope")
+        _gate(scope, "Bash", command)
         if command:
             CommandGuard.check(command, scope)
         return await handlers.bash_exec(**kwargs)
@@ -84,9 +91,7 @@ def build_scoped_router(
 
     # GREP — file search with tool permission check + path guard
     async def grep_search_guarded(**kwargs: Any) -> str:
-        allowed, mode = scope.check("Grep", kwargs.get("path", "."))
-        if not allowed:
-            raise PermissionError("Grep access is not allowed in this scope")
+        _gate(scope, "Grep", kwargs.get("path", "."))
         path = kwargs.get("path", ".")
         PathGuard.resolve_and_check(path, scope, "read")
         return await handlers.grep_search(**kwargs)
@@ -95,9 +100,7 @@ def build_scoped_router(
 
     # GLOB — glob pattern matching with tool permission check + path guard
     async def glob_search_guarded(**kwargs: Any) -> str:
-        allowed, mode = scope.check("Glob", kwargs.get("path", "."))
-        if not allowed:
-            raise PermissionError("Glob access is not allowed in this scope")
+        _gate(scope, "Glob", kwargs.get("path", "."))
         path = kwargs.get("path", ".")
         PathGuard.resolve_and_check(path, scope, "read")
         return await handlers.glob_search(**kwargs)
@@ -123,9 +126,7 @@ def build_scoped_router(
         and parent_config is not None
     ):
         async def spawn_agent_guarded(**kwargs: Any) -> str:
-            allowed, mode = scope.check("spawn_agent")
-            if not allowed:
-                raise PermissionError("Agent spawning is not allowed in this scope")
+            _gate(scope, "spawn_agent")
             spawn_agent_handler = handlers.make_spawn_agent_handler(
                 agent_registry, spawn_fn, parent_config
             )
@@ -135,9 +136,7 @@ def build_scoped_router(
 
     # ── AskUserQuestion — interaction tool with permission check ────────────
     async def ask_user_question_guarded(**kwargs: Any) -> str:
-        allowed, mode = scope.check("AskUserQuestion")
-        if not allowed:
-            raise PermissionError("AskUserQuestion is not allowed in this scope")
+        _gate(scope, "AskUserQuestion")
         if ask_user_question_callback:
             return await ask_user_question_callback(**kwargs)
         return await handlers.ask_user_question(**kwargs)
@@ -146,60 +145,52 @@ def build_scoped_router(
 
     # ── Skill — skill execution with permission check ───────────────────────
     async def execute_skill_guarded(**kwargs: Any) -> str:
-        allowed, mode = scope.check("Skill")
-        if not allowed:
-            raise PermissionError("Skill execution is not allowed in this scope")
+        _gate(scope, "Skill")
         return await handlers.execute_skill(**kwargs)
 
     router.register_handler(ToolType.SKILL, execute_skill_guarded)
 
     # ── Task management tools with permission check ─────────────────────────
     async def task_create_guarded(**kwargs: Any) -> str:
-        allowed, mode = scope.check("TaskCreate")
-        if not allowed:
-            raise PermissionError("TaskCreate is not allowed in this scope")
+        _gate(scope, "TaskCreate")
         return await handlers.task_create(**kwargs)
 
     router.register_handler(ToolType.TASK_CREATE, task_create_guarded)
 
     async def task_get_guarded(**kwargs: Any) -> str:
-        allowed, mode = scope.check("TaskGet")
-        if not allowed:
-            raise PermissionError("TaskGet is not allowed in this scope")
+        _gate(scope, "TaskGet")
         return await handlers.task_get(**kwargs)
 
     router.register_handler(ToolType.TASK_GET, task_get_guarded)
 
     async def task_list_guarded(**kwargs: Any) -> str:
-        allowed, mode = scope.check("TaskList")
-        if not allowed:
-            raise PermissionError("TaskList is not allowed in this scope")
+        _gate(scope, "TaskList")
         return await handlers.task_list(**kwargs)
 
     router.register_handler(ToolType.TASK_LIST, task_list_guarded)
 
     async def task_output_guarded(**kwargs: Any) -> str:
-        allowed, mode = scope.check("TaskOutput")
-        if not allowed:
-            raise PermissionError("TaskOutput is not allowed in this scope")
+        _gate(scope, "TaskOutput")
         return await handlers.task_output(**kwargs)
 
     router.register_handler(ToolType.TASK_OUTPUT, task_output_guarded)
 
     async def task_stop_guarded(**kwargs: Any) -> str:
-        allowed, mode = scope.check("TaskStop")
-        if not allowed:
-            raise PermissionError("TaskStop is not allowed in this scope")
+        _gate(scope, "TaskStop")
         return await handlers.task_stop(**kwargs)
 
     router.register_handler(ToolType.TASK_STOP, task_stop_guarded)
 
     async def task_update_guarded(**kwargs: Any) -> str:
-        allowed, mode = scope.check("TaskUpdate")
-        if not allowed:
-            raise PermissionError("TaskUpdate is not allowed in this scope")
+        _gate(scope, "TaskUpdate")
         return await handlers.task_update(**kwargs)
 
     router.register_handler(ToolType.TASK_UPDATE, task_update_guarded)
+
+    # MEMORY_SEARCH — read-only, registered unconditionally
+    async def memory_search_handler(**kwargs: Any) -> str:
+        return await handlers.memory_search(**kwargs)
+
+    router.register_handler(ToolType.MEMORY_SEARCH, memory_search_handler)
 
     return router

@@ -26,6 +26,7 @@ class ToolType(Enum):
     TASK_OUTPUT = "TaskOutput"
     TASK_STOP = "TaskStop"
     TASK_UPDATE = "TaskUpdate"
+    MEMORY_SEARCH = "MemorySearch"
 
 
 class ToolStatus(Enum):
@@ -36,6 +37,7 @@ class ToolStatus(Enum):
     FAILED = "failed"
     TIMEOUT = "timeout"
     CANCELLED = "cancelled"
+    AWAITING_APPROVAL = "awaiting_approval"
 
 
 @dataclass
