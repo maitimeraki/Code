@@ -386,13 +386,16 @@ async def memory_search(query: str, source: str = "all", limit: int = 3) -> str:
                 errors = await get_errors_by_type(query, limit)
             else:
                 pitfalls = await get_top_pitfalls(limit=50)
-                errors = sorted(pitfalls, key=lambda x: x.get("occurrence_count", 0), reverse=True)[:limit]
+                errors = sorted(pitfalls, key=lambda x: x.occurrence_count or 0, reverse=True)[:limit]
 
             for err in errors:
-                entry = f"\n[Error] {err.get('signature', 'Unknown')}\n"
-                entry += f"Context: {(err.get('context', '') or '')[:400]}\n"
-                if err.get("resolution"):
-                    entry += f"Resolution: {err.get('resolution')}\n"
+                signature = getattr(err, 'signature', 'Unknown')
+                context = getattr(err, 'context', '') or ''
+                resolution = getattr(err, 'resolution', None)
+                entry = f"\n[Error] {signature}\n"
+                entry += f"Context: {context[:400]}\n"
+                if resolution:
+                    entry += f"Resolution: {resolution}\n"
                 if char_count + len(entry) <= max_chars:
                     results.append(entry)
                     char_count += len(entry)
