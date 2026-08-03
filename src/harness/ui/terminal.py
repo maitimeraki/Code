@@ -181,7 +181,9 @@ class TerminalUI:
             self._pending_approvals = await get_pending_approvals(task_id)
             if self._current_approval_idx >= len(self._pending_approvals):
                 self._current_approval_idx = max(0, len(self._pending_approvals) - 1)
-        except Exception:
+        except Exception as e:
+            import logging
+            logging.warning(f"Failed to poll approvals for task {task_id}: {str(e)}", exc_info=True)
             self._pending_approvals = []
             self._current_approval_idx = 0
 
@@ -196,8 +198,10 @@ class TerminalUI:
         """Handle approval request from orchestrator.
 
         Returns True if approved, False otherwise.
+        SECURITY: Fails CLOSED — denies on any system error (never approve if safety check fails).
         """
         from harness.core.approval_manager import create_approval_request, approve_request
+        import logging
 
         try:
             req = await create_approval_request(
@@ -209,12 +213,31 @@ class TerminalUI:
             self._pending_approvals.append(req)
             self._dirty = True
 
-            # For now, auto-approve in UI mode (user has explicit context)
-            # In production, this would show an interactive prompt
             await approve_request(req.id, approved=True)
             return True
-        except Exception:
-            return True  # Fail open: approve if approval system unavailable
+        except Exception as e:
+            logging.error(f"SECURITY: Approval system failed for tool '{tool}': {str(e)}", exc_info=True)
+            self.main_panel.add_error(
+                f"⚠️  Approval system error for {tool}. Tool execution BLOCKED for safety."
+            )
+            return False  # Fail closed: deny by default on any error
+
+    def _validate_questions(self, questions: Optional[list]) -> list:
+        """Ensure questions structure is valid, return safe default if not."""
+        if not questions or not isinstance(questions, list):
+            return [{"question": "No question provided", "options": []}]
+        validated = []
+        for q in questions:
+            if not isinstance(q, dict):
+                continue
+            opts = q.get("options", [])
+            if not isinstance(opts, list):
+                opts = []
+            validated.append({
+                "question": q.get("question", "Question"),
+                "options": opts,
+            })
+        return validated or [{"question": "No question provided", "options": []}]
 
     # ── AskUserQuestion interactive picker ─────────────────────────────────
 
@@ -229,7 +252,7 @@ class TerminalUI:
 
     async def handle_ask_user_question(
         self, questions: Optional[list] = None, multi_select: bool = False,
-        preview: Optional[dict] = None,
+        preview: Optional[dict] = None, overview: str = "",
     ) -> str:
         """Handle AskUserQuestion: show tabbed question form, await all answers.
 
@@ -238,13 +261,13 @@ class TerminalUI:
         The future resolves when the user presses Enter on the Submit tab.
         """
         async with self._question_lock:
-            qs = questions or [{"question": "No question provided", "options": []}]
+            qs = self._validate_questions(questions)
 
             from harness.config import get_settings
             timeout_seconds = get_settings().ask_question_timeout_seconds
             future: asyncio.Future = asyncio.Future()
 
-            overview = qs[0].get("overview", "") if qs else ""
+            overview = overview or (qs[0].get("overview", "") if qs else "")
 
             state = {
                 "questions": qs,
@@ -685,32 +708,32 @@ class TerminalUI:
 
                 # ---- Other events (skill, agent_call, etc.) ────────────
                 if entry.source == "skill":
+                    skill_data = entry.data or {}
                     rendered = OutputRenderer.render_skill_call(
-                        entry.data.get("skill", "unknown"),
-                        entry.data.get("params")
+                        skill_data.get("skill", "unknown"),
+                        skill_data.get("params")
                     )
                 elif entry.source == "agent_call":
-                    # Agent spawn
+                    agent_data = entry.data or {}
                     rendered = OutputRenderer.render_agent_call(
-                        entry.data.get("agent", "unknown"),
-                        entry.data.get("task", ""),
-                        entry.data.get("iteration")
+                        agent_data.get("agent", "unknown"),
+                        agent_data.get("task", ""),
+                        agent_data.get("iteration")
                     )
                 elif entry.source == "agent_status":
-                    # Agent status change
+                    status_data = entry.data or {}
                     rendered = OutputRenderer.render_agent_status(
-                        entry.data.get("agent", "unknown"),
-                        entry.data.get("status", "UNKNOWN"),
-                        entry.data.get("detail", "")
+                        status_data.get("agent", "unknown"),
+                        status_data.get("status", "UNKNOWN"),
+                        status_data.get("detail", "")
                     )
                 elif entry.source == "agent":
-                    # Agent reasoning/thinking (streaming LLM response)
+                    message = getattr(entry, "message", "")
                     rendered = OutputRenderer.render_llm_response_stream(
-                        entry.message,
+                        message or "",
                         model="Agent"
                     )
                 else:
-                    # Fallback to generic log entry render for everything else
                     rendered = OutputRenderer.render_log_entry(entry)
 
                 self.main_panel.add_text(rendered)
@@ -836,11 +859,12 @@ class TerminalUI:
         if picker_height > 0:
             if self._pending_approvals and self._current_approval_idx < len(self._pending_approvals):
                 approval = self._pending_approvals[self._current_approval_idx]
+                approval_action = getattr(approval, "proposed_action", None) or {}
                 picker_widget = OutputRenderer.render_permission_prompt(
-                    tool=approval.proposed_action.get("tool_type", "unknown") if approval.proposed_action else "unknown",
-                    command_str=str(approval.proposed_action.get("args", {}) if approval.proposed_action else {}),
-                    risk=approval.risk_level,
-                    description=approval.summary or "",
+                    tool=approval_action.get("tool_type", "unknown"),
+                    command_str=str(approval_action.get("args", {})),
+                    risk=getattr(approval, "risk_level", "medium"),
+                    description=getattr(approval, "summary", "") or "",
                 )
                 layout["picker"].update(picker_widget)
             elif self._pending_question:
@@ -861,29 +885,39 @@ class TerminalUI:
     async def _apply_approval_decision(self, approval_id: str, decision: str) -> None:
         """Record approval decision in DB (Y handler)."""
         from harness.core.approval_manager import apply_decision
+        import logging
         try:
+            if not approval_id:
+                return
             await apply_decision(approval_id, decision, decided_by="user")
-            # Remove this approval from pending list
             self._pending_approvals = [
-                a for a in self._pending_approvals if a.approval_id != approval_id
+                a for a in self._pending_approvals
+                if getattr(a, "approval_id", None) != approval_id
             ]
             self._current_approval_idx = 0
-        except Exception:
+        except Exception as e:
+            logging.error(f"Failed to apply approval decision: {str(e)}", exc_info=True)
             pass
 
     async def _prompt_rejection_reason(self, approval) -> None:
         """Prompt for rejection reason (N handler)."""
         from harness.core.approval_manager import apply_decision
-        # ponytail: deny immediately without collecting reason.
-        # Reason collection would need interactive input loop integration.
+        import logging
+        if not approval:
+            return
         try:
-            await apply_decision(approval.approval_id, "rejected", decided_by="user", notes="")
+            approval_id = getattr(approval, "approval_id", None)
+            if not approval_id:
+                logging.warning("Approval object missing approval_id")
+                return
+            await apply_decision(approval_id, "rejected", decided_by="user", notes="")
             self._pending_approvals = [
-                a for a in self._pending_approvals if a.approval_id != approval.approval_id
+                a for a in self._pending_approvals
+                if getattr(a, "approval_id", None) != approval_id
             ]
             self._current_approval_idx = 0
-        except Exception:
-            pass
+        except Exception as e:
+            logging.error(f"Failed to reject approval: {str(e)}", exc_info=True)
         self._dirty = True
 
     async def _apply_approval_with_session_grant(self, approval, decision: str) -> None:
@@ -891,15 +925,21 @@ class TerminalUI:
         from harness.core.approval_manager import apply_decision
         from harness.core.approval_policy import grant_session, fingerprint_bash, fingerprint_file
         from harness.tools.models import ToolType
+        import logging
 
+        if not approval:
+            return
         try:
-            await apply_decision(approval.approval_id, decision, decided_by="user")
-            # Extract tool and args from proposed_action
-            action = approval.proposed_action or {}
+            approval_id = getattr(approval, "approval_id", None)
+            if not approval_id:
+                logging.warning("Approval object missing approval_id")
+                return
+
+            await apply_decision(approval_id, decision, decided_by="user")
+            action = getattr(approval, "proposed_action", None) or {}
             tool_name = action.get("tool_type", "")
             args = action.get("args", {})
 
-            # Fingerprint based on tool type
             if "Bash" in tool_name:
                 fp = fingerprint_bash(args.get("command", ""))
             elif any(x in tool_name for x in ["Read", "Write", "Edit"]):
@@ -911,25 +951,32 @@ class TerminalUI:
                 grant_session(tool_name, fp)
 
             self._pending_approvals = [
-                a for a in self._pending_approvals if a.approval_id != approval.approval_id
+                a for a in self._pending_approvals
+                if getattr(a, "approval_id", None) != approval_id
             ]
             self._current_approval_idx = 0
-        except Exception:
-            pass
+        except Exception as e:
+            logging.error(f"Failed to apply session grant: {str(e)}", exc_info=True)
 
     async def _apply_approval_with_persisted_grant(self, approval, decision: str) -> None:
         """Approve and save persisted rule (P handler)."""
         from harness.core.approval_manager import apply_decision
         from harness.core.approval_policy import grant_persisted, fingerprint_bash, fingerprint_file
+        import logging
 
+        if not approval:
+            return
         try:
-            await apply_decision(approval.approval_id, decision, decided_by="user")
-            # Extract tool and args
-            action = approval.proposed_action or {}
+            approval_id = getattr(approval, "approval_id", None)
+            if not approval_id:
+                logging.warning("Approval object missing approval_id")
+                return
+
+            await apply_decision(approval_id, decision, decided_by="user")
+            action = getattr(approval, "proposed_action", None) or {}
             tool_name = action.get("tool_type", "")
             args = action.get("args", {})
 
-            # Fingerprint based on tool type
             if "Bash" in tool_name:
                 fp = fingerprint_bash(args.get("command", ""))
             elif any(x in tool_name for x in ["Read", "Write", "Edit"]):
@@ -941,11 +988,12 @@ class TerminalUI:
                 await grant_persisted(tool_name, fp, decision="allow")
 
             self._pending_approvals = [
-                a for a in self._pending_approvals if a.approval_id != approval.approval_id
+                a for a in self._pending_approvals
+                if getattr(a, "approval_id", None) != approval_id
             ]
             self._current_approval_idx = 0
-        except Exception:
-            pass
+        except Exception as e:
+            logging.error(f"Failed to apply persisted grant: {str(e)}", exc_info=True)
 
     async def input_loop(self) -> None:
         """Main keyboard input loop."""
@@ -1532,14 +1580,28 @@ class TerminalUI:
         try:
             # Preferred path: main agent with tools + delegation.
             if self.orchestrator:
-                result = await self.orchestrator.chat(prompt, on_text_delta=append_chunk)
-                # If the agent produced output but streamed nothing, render it once.
-                if result and result.output and not self._active_text_raw.strip():
-                    append_chunk(result.output)
-                if result and not result.success and result.error:
-                    self.main_panel.add_error(f"Agent error: {result.error}")
-                self._dirty = True
-                return
+                try:
+                    result = await self.orchestrator.chat(prompt, on_text_delta=append_chunk)
+                    if result and result.output and not self._active_text_raw.strip():
+                        append_chunk(result.output)
+                    if result and not result.success and result.error:
+                        self.main_panel.add_error(f"Agent error: {result.error}")
+                    self._dirty = True
+                    return
+                except asyncio.TimeoutError:
+                    self.main_panel.add_error(
+                        "⏱️  Agent timed out. Try a simpler task or check system logs."
+                    )
+                    self._dirty = True
+                    return
+                except Exception as e:
+                    import logging
+                    logging.exception(f"Orchestrator failed: {str(e)}")
+                    self.main_panel.add_error(
+                        f"❌ Agent system error: {type(e).__name__}. Check logs for details."
+                    )
+                    self._dirty = True
+                    return
 
             # Fallback path: raw LLM stream (no tools).
             messages = []

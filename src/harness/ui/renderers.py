@@ -539,13 +539,13 @@ class OutputRenderer:
                     result.append("  ", style=Styles.CURSOR_BLINK)
 
                 num = opt.get("num", oi + 1)
-                title = opt.get("title", f"Option {num}")
+                title = opt.get("title") or opt.get("label") or opt.get("text") or opt.get("option") or f"Option {num}"
                 cstyle = Styles.OPTION_FOCUS if (is_focused or is_selected) else Styles.OPTION_NORMAL
 
                 result.append(f"{num}. ", style=Styles.TASK_BOX_PENDING)
                 result.append(title + "\n", style=cstyle)
 
-                detail = opt.get("detail", "")
+                detail = opt.get("detail") or opt.get("description") or opt.get("help") or opt.get("hint") or ""
                 if detail:
                     ds = Styles.OPTION_DETAIL if is_focused else Styles.INPUT_PLACEHOLDER
                     result.append(f"   {detail}\n", style=ds)
