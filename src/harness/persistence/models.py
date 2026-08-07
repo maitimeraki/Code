@@ -8,11 +8,29 @@ from sqlalchemy.orm import declarative_base
 Base = declarative_base()
 
 
+class Project(Base):
+    """Project registry for multi-project isolation."""
+    __tablename__ = "projects"
+
+    project_id = Column(String(16), primary_key=True, index=True)
+    project_name = Column(String(256), nullable=False)
+    project_root = Column(String(512), nullable=False, unique=True)
+    git_remote = Column(String(512), nullable=True)
+    created_at = Column(DateTime, default=datetime.now, index=True)
+    last_accessed = Column(DateTime, default=datetime.now, onupdate=datetime.now, index=True)
+    metadata_json = Column(JSON, default={})
+
+    __table_args__ = (
+        Index('idx_project_accessed', 'last_accessed'),
+    )
+
+
 class Session(Base):
     """User session with full execution context."""
     __tablename__ = "sessions"
 
     session_id = Column(String(36), primary_key=True, index=True)
+    project_id = Column(String(16), nullable=True, index=True)  # Scoped to project
     user_id = Column(String(255), index=True)
     status = Column(String(50), default="active")  # active, paused, completed, failed
     created_at = Column(DateTime, default=datetime.now, index=True)
@@ -21,12 +39,17 @@ class Session(Base):
 
     metadata_json = Column(JSON, default={})
 
+    __table_args__ = (
+        Index('idx_session_project', 'project_id', 'session_id'),
+    )
+
 
 class Task(Base):
     """Task execution record."""
     __tablename__ = "tasks"
 
     task_id = Column(String(36), primary_key=True, index=True)
+    project_id = Column(String(16), nullable=True, index=True)  # Scoped to project
     session_id = Column(String(36), index=True)
     description = Column(Text)
     status = Column(String(50), default="pending")  # pending, running, completed, failed
@@ -51,6 +74,8 @@ class Task(Base):
 
     __table_args__ = (
         Index('ix_task_phase_status', 'phase', 'status'),
+        Index('idx_task_project_status', 'project_id', 'status'),
+        Index('idx_task_project_session', 'project_id', 'session_id'),
     )
 
 
@@ -59,6 +84,7 @@ class AgentExecution(Base):
     __tablename__ = "agent_executions"
 
     execution_id = Column(String(36), primary_key=True, index=True)
+    project_id = Column(String(16), nullable=True, index=True)  # Scoped to project
     task_id = Column(String(36), index=True)
     agent_type = Column(String(100), index=True)
     status = Column(String(50))  # running, completed, failed
@@ -80,6 +106,7 @@ class AgentExecution(Base):
     __table_args__ = (
         Index('ix_agentexec_trace', 'trace_id', 'started_at'),
         Index('ix_agentexec_task_parent', 'task_id', 'parent_execution_id'),
+        Index('idx_agentexec_project_task', 'project_id', 'task_id'),
     )
 
 
@@ -88,6 +115,7 @@ class ToolCall(Base):
     __tablename__ = "tool_calls"
 
     call_id = Column(String(36), primary_key=True, index=True)
+    project_id = Column(String(16), nullable=True, index=True)  # Scoped to project
     task_id = Column(String(36), index=True)
     tool_type = Column(String(100), index=True)
     status = Column(String(50))  # success, failed, timeout
@@ -105,6 +133,7 @@ class ToolCall(Base):
 
     __table_args__ = (
         Index('ix_toolcall_task_time', 'task_id', 'started_at'),
+        Index('idx_toolcall_project_task', 'project_id', 'task_id'),
     )
 
 
@@ -113,6 +142,7 @@ class KnowledgeEntry(Base):
     __tablename__ = "knowledge_entries"
 
     entry_id = Column(String(36), primary_key=True, index=True)
+    project_id = Column(String(16), nullable=True, index=True)  # Scoped to project
     task_type = Column(String(255), index=True)  # "authentication", "api_design", etc.
     solution = Column(Text)  # The solution/pattern description
     code_example = Column(Text, nullable=True)
@@ -122,16 +152,25 @@ class KnowledgeEntry(Base):
     created_at = Column(DateTime, default=datetime.now, index=True)
     last_used_at = Column(DateTime, nullable=True)
 
+    __table_args__ = (
+        Index('idx_knowledge_project', 'project_id', 'task_type'),
+    )
+
 
 class TaskJournal(Base):
     """Episodic log: iteration history for a task."""
     __tablename__ = "task_journals"
 
     journal_id = Column(String(36), primary_key=True, index=True)
+    project_id = Column(String(16), nullable=True, index=True)  # Scoped to project
     task_id = Column(String(36), index=True)  # Foreign key to Task
     iteration = Column(Integer, index=True)  # Which iteration this log belongs to
     message = Column(Text)  # What happened in this iteration
     created_at = Column(DateTime, default=datetime.now, index=True)
+
+    __table_args__ = (
+        Index('idx_journal_project_task', 'project_id', 'task_id'),
+    )
 
 
 class ApprovalRequest(Base):
@@ -139,6 +178,7 @@ class ApprovalRequest(Base):
     __tablename__ = "approval_requests"
 
     approval_id = Column(String(36), primary_key=True, index=True)
+    project_id = Column(String(16), nullable=True, index=True)  # Scoped to project
     task_id = Column(String(36), index=True)
     proposed_action = Column(JSON)  # Tool call details: {tool_type, args, ...}
     status = Column(String(50), default="pending")  # pending, approved, rejected
@@ -157,6 +197,7 @@ class ExecutedAction(Base):
     __tablename__ = "executed_actions"
 
     idempotency_key = Column(String(36), primary_key=True, index=True)
+    project_id = Column(String(16), nullable=True, index=True)  # Scoped to project
     task_id = Column(String(36), index=True)
     result_json = Column(JSON, nullable=True)  # Result of execution
     error = Column(Text, nullable=True)  # Error if execution failed
@@ -168,6 +209,7 @@ class ErrorMemory(Base):
     __tablename__ = "error_memory"
 
     signature = Column(String(255), primary_key=True, index=True)  # Hash of error type + message
+    project_id = Column(String(16), nullable=True, index=True)  # Scoped to project (nullable for global)
     context = Column(Text, nullable=True)  # Where it happened (task type, tool, etc.)
     root_cause = Column(Text, nullable=True)  # What caused it (if known)
     resolution = Column(Text, nullable=True)  # How to fix it (if known)
@@ -176,12 +218,17 @@ class ErrorMemory(Base):
     first_seen = Column(DateTime, default=datetime.now, index=True)
     last_seen = Column(DateTime, default=datetime.now, index=True)
 
+    __table_args__ = (
+        Index('idx_errormem_project', 'project_id', 'signature'),
+    )
+
 
 class UserPreference(Base):
     """User preferences for behavior customization."""
     __tablename__ = "user_preferences"
 
     pref_id = Column(String(36), primary_key=True, index=True)
+    project_id = Column(String(16), nullable=True, index=True)  # Scoped to project (nullable for user-level)
     user_id = Column(String(255), index=True)  # FK to user
     key = Column(String(255), index=True)  # Preference name (e.g., "auto_approve_risk_level")
     value = Column(Text)  # Preference value (JSON serializable)
@@ -198,6 +245,7 @@ class PendingQuestion(Base):
     __tablename__ = "pending_questions"
 
     id = Column(String(36), primary_key=True, index=True)
+    project_id = Column(String(16), nullable=True, index=True)  # Scoped to project
     session_id = Column(String(36), nullable=False, index=True)
     question_text = Column(Text, nullable=False)
     header = Column(String(255), default="")
@@ -214,6 +262,7 @@ class Analytics(Base):
     __tablename__ = "analytics"
 
     analytics_id = Column(String(36), primary_key=True, index=True)
+    project_id = Column(String(16), nullable=True, index=True)  # Scoped to project (nullable for global)
     metric_name = Column(String(255), index=True)  # "agent_success_rate", "avg_token_usage", etc.
     metric_value = Column(Float)
     dimension = Column(String(255), nullable=True)  # e.g., "architect", "security_reviewer"

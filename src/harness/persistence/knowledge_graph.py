@@ -6,30 +6,42 @@ from uuid import uuid4
 import asyncio
 import structlog
 from sqlalchemy import select
+
 from rank_bm25 import BM25Okapi
 
 from harness.persistence.database import get_session
 from harness.persistence.models import KnowledgeEntry
+from harness.persistence.project_detector import ProjectDetector
 
 logger = structlog.get_logger(__name__)
 
 
 class KnowledgeGraph:
-    """Store and search learned solutions for reuse across tasks via SQLite."""
+    """Project-scoped knowledge graph with SQLite persistence."""
 
-    def __init__(self):
+    def __init__(self, project_id: Optional[str] = None):
+        """Initialize with optional project_id; auto-detect if None."""
+        self.project_id = project_id or ProjectDetector.detect_project_id()
         self.bm25_index: Optional[BM25Okapi] = None
         self._cache: Dict[str, KnowledgeEntry] = {}
 
     async def init(self) -> None:
-        """Initialize: load all entries from DB and rebuild index."""
+        """Initialize: load entries for THIS project only."""
         async with get_session() as db_session:
-            result = await db_session.execute(select(KnowledgeEntry))
+            result = await db_session.execute(
+                select(KnowledgeEntry).where(
+                    KnowledgeEntry.project_id == self.project_id
+                )
+            )
             entries = result.scalars().all()
             for entry in entries:
                 self._cache[entry.entry_id] = entry
         self._rebuild_index()
-        logger.info(f"Knowledge graph initialized with {len(self._cache)} entries")
+        logger.info(
+            f"Knowledge graph initialized",
+            project_id=self.project_id,
+            entries=len(self._cache)
+        )
 
     async def add_solution(
         self,
@@ -38,12 +50,13 @@ class KnowledgeGraph:
         code_example: Optional[str] = None,
         quality_score: float = 0.5,
     ) -> str:
-        """Add a learned solution to the knowledge base and persist to DB."""
+        """Add a learned solution to the knowledge base (project-scoped)."""
         entry_id = str(uuid4())
 
         async with get_session() as db_session:
             entry = KnowledgeEntry(
                 entry_id=entry_id,
+                project_id=self.project_id,
                 task_type=task_type,
                 solution=solution,
                 code_example=code_example,
@@ -54,7 +67,6 @@ class KnowledgeGraph:
             db_session.add(entry)
             await db_session.commit()
 
-        # Update cache
         self._cache[entry_id] = entry
         self._rebuild_index()
 
@@ -63,6 +75,7 @@ class KnowledgeGraph:
             entry_id=entry_id,
             task_type=task_type,
             quality=quality_score,
+            project_id=self.project_id,
         )
         return entry_id
 
@@ -72,7 +85,6 @@ class KnowledgeGraph:
             self.bm25_index = None
             return
 
-        # Tokenize documents (order preserved via dict iteration)
         corpus = [
             f"{entry.task_type} {entry.solution}".lower().split()
             for entry in self._cache.values()
@@ -88,22 +100,17 @@ class KnowledgeGraph:
         top_k: int = 5,
         min_quality: float = 0.0,
     ) -> List[KnowledgeEntry]:
-        """Search knowledge base for similar solutions."""
+        """Search knowledge base for similar solutions (project-scoped)."""
         if not self.bm25_index or not self._cache:
             logger.warning("Knowledge graph empty, no results")
             return []
 
-        # Tokenize query
         query_tokens = query.lower().split()
-
-        # Get BM25 scores
         scores = self.bm25_index.get_scores(query_tokens)
 
-        # Rank entries (zip preserves dict order)
         ranked = [(entry, score) for entry, score in zip(self._cache.values(), scores)]
         ranked.sort(key=lambda x: x[1], reverse=True)
 
-        # Filter and limit
         results = []
         for entry, score in ranked:
             if score <= 0.0:
@@ -121,6 +128,7 @@ class KnowledgeGraph:
             query=query[:50],
             results=len(results),
             task_type=task_type,
+            project_id=self.project_id,
         )
 
         return results
@@ -137,7 +145,6 @@ class KnowledgeGraph:
             entry.last_used_at = datetime.now()
             await db_session.commit()
 
-        # Update cache
         if entry_id in self._cache:
             self._cache[entry_id].use_count = entry.use_count
             self._cache[entry_id].last_used_at = entry.last_used_at
@@ -157,31 +164,34 @@ class KnowledgeGraph:
         ]
 
 
-# Module-level singleton for knowledge graph (avoids per-spawn full-table-load)
-_kg: Optional[KnowledgeGraph] = None
+# Per-project singleton instances
+_kg_by_project: Dict[str, KnowledgeGraph] = {}
 _kg_lock = asyncio.Lock()
 
 
-async def get_knowledge_graph() -> KnowledgeGraph:
-    """Get or create the process-level knowledge graph singleton.
+async def get_knowledge_graph(project_id: Optional[str] = None) -> KnowledgeGraph:
+    """Get or create knowledge graph for project.
 
-    Double-checked locking ensures concurrent spawns trigger only one init().
+    Uses per-project singletons to avoid duplicate initialization.
     """
-    global _kg
+    project_id = project_id or ProjectDetector.detect_project_id()
 
-    # Fast path: already initialized
-    if _kg is not None:
-        return _kg
+    if project_id in _kg_by_project:
+        return _kg_by_project[project_id]
 
-    # Slow path: initialize under lock
     async with _kg_lock:
-        if _kg is None:
-            _kg = KnowledgeGraph()
-            await _kg.init()
-        return _kg
+        if project_id in _kg_by_project:
+            return _kg_by_project[project_id]
+
+        kg = KnowledgeGraph(project_id)
+        await kg.init()
+        _kg_by_project[project_id] = kg
+        return kg
 
 
-def dispose_kg() -> None:
-    """Reset the knowledge graph singleton (for testing)."""
-    global _kg
-    _kg = None
+def dispose_kg(project_id: Optional[str] = None) -> None:
+    """Reset the knowledge graph singleton for a project (for testing)."""
+    if project_id:
+        _kg_by_project.pop(project_id, None)
+    else:
+        _kg_by_project.clear()
