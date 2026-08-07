@@ -64,10 +64,12 @@ class AttemptCompletionArgs(BaseModel):
 class AskUserQuestionArgs(BaseModel):
     """Arguments for ask_user_question tool.
     Each question should have: question (str), options (list of dicts with label + optional description),
-    header (str), multiSelect (bool)."""
+    header (str, used as the tab label), multiSelect (bool).
+    overview is an optional intro line shown above the tabs."""
     questions: list = []
     multi_select: bool = False
     preview: Any = None
+    overview: str = ""
 
 
 class SkillArgs(BaseModel):

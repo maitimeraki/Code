@@ -142,6 +142,7 @@ async def ask_user_question(
     questions: list[dict] | None = None,
     multi_select: bool = False,
     preview: dict | None = None,
+    overview: str = "",
 ) -> str:
     """Ask the user a multiple-choice question.
 
@@ -153,6 +154,7 @@ async def ask_user_question(
         "questions": questions or [],
         "multi_select": multi_select,
         "preview": preview,
+        "overview": overview,
     }
     # ponytail: approval_callback wired by factory when available
     return json.dumps({"asked": True, "payload": payload, "pending": True})

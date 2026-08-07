@@ -5,22 +5,41 @@ from typing import Callable, Any, Optional
 from .models import ToolType
 from .router import ToolRouter
 from .permissions import PermissionScope, PathGuard, CommandGuard
+from .approval import ApprovalHandler, ApprovalUI, TerminalApprovalUI
 from . import handlers
 
 
-def _gate(scope: PermissionScope, tool_name: str, resource: str = "") -> bool:
-    """Check if tool is allowed and return whether approval is needed.
+def _make_gate(approval_handler: ApprovalHandler) -> Callable:
+    """Create a gate function that handles permission checks and approvals.
 
-    Returns:
-        True if tool requires approval, False if allowed without approval.
+    Returns a closure that:
+    1. Checks permission (allow/deny/ask)
+    2. If "ask", prompts user via ApprovalHandler
+    3. Raises PermissionError if denied or user rejects
 
-    Raises:
-        PermissionError: If tool is denied.
+    The gate returns None (success) if approved, raises if denied/rejected.
     """
-    allowed, mode = scope.check(tool_name, resource)
-    if not allowed:
-        raise PermissionError(f"{tool_name} is not allowed in this scope")
-    return mode == "requires_approval"
+    async def gate(scope: PermissionScope, tool_name: str, resource: str = "") -> None:
+        """Check permission and request approval if needed.
+
+        Raises:
+            PermissionError: If tool is denied or user rejects approval.
+        """
+        allowed, mode = scope.check(tool_name, resource)
+        if not allowed:
+            raise PermissionError(f"{tool_name} access denied for resource: {resource}")
+
+        if mode == "requires_approval":
+            desc = f"Execute {tool_name}"
+            if resource:
+                desc += f" on {resource}"
+            await approval_handler.request_approval(
+                tool=tool_name,
+                resource=resource,
+                description=desc,
+            )
+
+    return gate
 
 
 
@@ -30,6 +49,7 @@ def build_scoped_router(
     spawn_fn: Callable = None,
     parent_config: Any = None,
     ask_user_question_callback: Optional[Callable] = None,
+    approval_ui: Optional[ApprovalUI] = None,
 ) -> ToolRouter:
     """Build a ToolRouter with permission-guarded handlers.
 
@@ -37,21 +57,25 @@ def build_scoped_router(
     - File operations: PathGuard for allowed_paths, scope.check() for tool permissions
     - Bash: CommandGuard + scope.check() for command patterns
     - Agent spawn: scope.check() for agent spawning permission
+    - Approval: For "ask" mode tools, prompts user with 3 choices (this time / session / deny)
 
     Args:
         scope: The PermissionScope defining what this router can do.
         agent_registry: Optional agent registry for spawn_agent handler.
         spawn_fn: Optional spawn function for spawning nested agents.
         parent_config: Optional parent agent config for nested spawns.
+        approval_ui: Optional custom ApprovalUI (defaults to TerminalApprovalUI).
 
     Returns:
         A ToolRouter with handlers registered and guarded.
     """
     router = ToolRouter()
+    approval_handler = ApprovalHandler(ui=approval_ui or TerminalApprovalUI())
+    gate = _make_gate(approval_handler)
 
     # READ — file read with tool permission check + path guard
     async def read_file_guarded(**kwargs: Any) -> str:
-        _gate(scope, "Read", kwargs.get("path", ""))
+        await gate(scope, "Read", kwargs.get("path", ""))
         path = kwargs.get("path")
         if path:
             PathGuard.resolve_and_check(path, scope, "read")
@@ -61,7 +85,7 @@ def build_scoped_router(
 
     # WRITE — file write with tool permission check + path guard
     async def write_file_guarded(**kwargs: Any) -> str:
-        _gate(scope, "Write", kwargs.get("path", ""))
+        await gate(scope, "Write", kwargs.get("path", ""))
         path = kwargs.get("path")
         if path:
             PathGuard.resolve_and_check(path, scope, "write")
@@ -71,7 +95,7 @@ def build_scoped_router(
 
     # EDIT — file edit with tool permission check + path guard
     async def edit_file_guarded(**kwargs: Any) -> str:
-        _gate(scope, "Edit", kwargs.get("path", ""))
+        await gate(scope, "Edit", kwargs.get("path", ""))
         path = kwargs.get("path")
         if path:
             PathGuard.resolve_and_check(path, scope, "write")
@@ -82,7 +106,7 @@ def build_scoped_router(
     # BASH — shell execution with tool permission check + command guard
     async def bash_exec_guarded(**kwargs: Any) -> str:
         command = kwargs.get("command", "")
-        _gate(scope, "Bash", command)
+        await gate(scope, "Bash", command)
         if command:
             CommandGuard.check(command, scope)
         return await handlers.bash_exec(**kwargs)
@@ -91,7 +115,7 @@ def build_scoped_router(
 
     # GREP — file search with tool permission check + path guard
     async def grep_search_guarded(**kwargs: Any) -> str:
-        _gate(scope, "Grep", kwargs.get("path", "."))
+        await gate(scope, "Grep", kwargs.get("path", "."))
         path = kwargs.get("path", ".")
         PathGuard.resolve_and_check(path, scope, "read")
         return await handlers.grep_search(**kwargs)
@@ -100,7 +124,7 @@ def build_scoped_router(
 
     # GLOB — glob pattern matching with tool permission check + path guard
     async def glob_search_guarded(**kwargs: Any) -> str:
-        _gate(scope, "Glob", kwargs.get("path", "."))
+        await gate(scope, "Glob", kwargs.get("path", "."))
         path = kwargs.get("path", ".")
         PathGuard.resolve_and_check(path, scope, "read")
         return await handlers.glob_search(**kwargs)
@@ -126,7 +150,7 @@ def build_scoped_router(
         and parent_config is not None
     ):
         async def spawn_agent_guarded(**kwargs: Any) -> str:
-            _gate(scope, "spawn_agent")
+            await gate(scope, "spawn_agent")
             spawn_agent_handler = handlers.make_spawn_agent_handler(
                 agent_registry, spawn_fn, parent_config
             )
@@ -136,7 +160,7 @@ def build_scoped_router(
 
     # ── AskUserQuestion — interaction tool with permission check ────────────
     async def ask_user_question_guarded(**kwargs: Any) -> str:
-        _gate(scope, "AskUserQuestion")
+        await gate(scope, "AskUserQuestion")
         if ask_user_question_callback:
             return await ask_user_question_callback(**kwargs)
         return await handlers.ask_user_question(**kwargs)
@@ -145,44 +169,44 @@ def build_scoped_router(
 
     # ── Skill — skill execution with permission check ───────────────────────
     async def execute_skill_guarded(**kwargs: Any) -> str:
-        _gate(scope, "Skill")
+        await gate(scope, "Skill")
         return await handlers.execute_skill(**kwargs)
 
     router.register_handler(ToolType.SKILL, execute_skill_guarded)
 
     # ── Task management tools with permission check ─────────────────────────
     async def task_create_guarded(**kwargs: Any) -> str:
-        _gate(scope, "TaskCreate")
+        await gate(scope, "TaskCreate")
         return await handlers.task_create(**kwargs)
 
     router.register_handler(ToolType.TASK_CREATE, task_create_guarded)
 
     async def task_get_guarded(**kwargs: Any) -> str:
-        _gate(scope, "TaskGet")
+        await gate(scope, "TaskGet")
         return await handlers.task_get(**kwargs)
 
     router.register_handler(ToolType.TASK_GET, task_get_guarded)
 
     async def task_list_guarded(**kwargs: Any) -> str:
-        _gate(scope, "TaskList")
+        await gate(scope, "TaskList")
         return await handlers.task_list(**kwargs)
 
     router.register_handler(ToolType.TASK_LIST, task_list_guarded)
 
     async def task_output_guarded(**kwargs: Any) -> str:
-        _gate(scope, "TaskOutput")
+        await gate(scope, "TaskOutput")
         return await handlers.task_output(**kwargs)
 
     router.register_handler(ToolType.TASK_OUTPUT, task_output_guarded)
 
     async def task_stop_guarded(**kwargs: Any) -> str:
-        _gate(scope, "TaskStop")
+        await gate(scope, "TaskStop")
         return await handlers.task_stop(**kwargs)
 
     router.register_handler(ToolType.TASK_STOP, task_stop_guarded)
 
     async def task_update_guarded(**kwargs: Any) -> str:
-        _gate(scope, "TaskUpdate")
+        await gate(scope, "TaskUpdate")
         return await handlers.task_update(**kwargs)
 
     router.register_handler(ToolType.TASK_UPDATE, task_update_guarded)

@@ -6,6 +6,7 @@ Aligned with Claude Code's permission model:
 - Minimal structure, no separate Guard classes
 """
 
+import fnmatch
 import re
 import shlex
 from dataclasses import dataclass, field, replace
@@ -42,28 +43,47 @@ class PermissionScope:
         """Build a PermissionScope from app settings.
 
         Reads get_app_settings().get("permissions", {}) with Claude Code format:
-        - allow: list of allowed tools
-        - deny: list of denied tools
-        - ask: list of tools requiring approval
-        - patterns: dict mapping tool -> patterns to deny (e.g., {"Read": ["Read(.env*)"]})
+        - allow: list of allowed tools (no pattern checking)
+        - ask: list of tools requiring approval (no pattern checking)
+        - deny: list of tools with specific path patterns to block
+        - patterns: dict mapping tool -> glob patterns to deny (e.g., {"Read": [".env*", ".git/*"]})
         - alwaysAsk: list of tools always requiring approval
         - defaultMode: "auto", "strict", or "permissive"
         """
         app_settings = get_app_settings()
         perm_config = app_settings.get("permissions", {})
 
-        # Build tool permissions from allow/deny/ask lists
         tools = {}
+
+        # Allow tools - no patterns, always allowed
         for tool in perm_config.get("allow", []):
             tools[tool] = ToolPermission(tool=tool, mode="allow")
 
-        for tool in perm_config.get("deny", []):
-            tools[tool] = ToolPermission(tool=tool, mode="deny")
-
-        patterns_config = perm_config.get("patterns", {})
+        # Ask tools - no patterns, always require approval
         for tool in perm_config.get("ask", []):
-            patterns = patterns_config.get(tool, [])
-            tools[tool] = ToolPermission(tool=tool, mode="ask", patterns=patterns)
+            tools[tool] = ToolPermission(tool=tool, mode="ask")
+
+        # Deny tools - WITH patterns to block specific paths
+        # Support both new format (deny as tool names, patterns separate)
+        # and legacy format (deny as "Tool(pattern)" strings)
+        # Deny OVERRIDES any prior mode (allow/ask) for the same tool
+        patterns_config = perm_config.get("patterns", {})
+        for tool_entry in perm_config.get("deny", []):
+            tool_name = tool_entry
+            patterns = []
+
+            # Legacy format: "Tool(pattern)" → extract both
+            if "(" in tool_entry and ")" in tool_entry:
+                tool_name, pattern_part = tool_entry.split("(", 1)
+                pattern_part = pattern_part.rstrip(")")
+                patterns = [pattern_part] if pattern_part else []
+
+            # New format: get patterns from patterns dict
+            patterns_from_config = patterns_config.get(tool_name, [])
+            if patterns_from_config:
+                patterns = patterns_from_config
+
+            tools[tool_name] = ToolPermission(tool=tool_name, mode="deny", patterns=patterns)
 
         # If no explicit config, default to allow common tools
         if not tools:
@@ -86,13 +106,16 @@ class PermissionScope:
         Returns (allowed, mode) where mode is:
         - None: allowed without approval
         - "requires_approval": allowed but needs user approval
-        - PermissionError: denied (caller should raise)
+        - None (with False): denied (caller should raise PermissionError)
         """
         perm = self.tools.get(tool)
 
-        # Deny is absolute (checked before always_ask)
+        # Deny mode: blocks when pattern matches; allows when pattern doesn't match
         if perm and perm.mode == "deny":
-            return False, None
+            if self._matches_patterns(resource, perm.patterns):
+                return False, None  # Pattern matched → BLOCK access
+            # Pattern didn't match → tool is allowed
+            return True, None
 
         # Always-ask tools require approval
         if tool in self.always_ask:
@@ -103,24 +126,49 @@ class PermissionScope:
                 return False, None
             return True, None
 
+        # Ask mode: require approval for all operations
         if perm.mode == "ask":
-            if self._matches_patterns(resource, perm.patterns):
-                return True, "requires_approval"
-            return True, None
+            return True, "requires_approval"
 
+        # Allow mode: always permitted
         return True, None
 
     @staticmethod
     def _matches_patterns(resource: str, patterns: list[str]) -> bool:
-        """Check if resource matches any pattern (e.g., "Read(.env*)" → deny .env files)."""
+        """Check if resource matches any pattern.
+
+        Patterns can be:
+        - Simple glob: ".env*" (matches filename)
+        - Path glob: ".git/*" (matches path components)
+        - Legacy format: "Tool(.env*)" → extracted as ".env*"
+        """
+        if not resource:
+            return False
+
+        resource_path = Path(resource)
+        filename = resource_path.name
+
         for pattern in patterns:
-            # Parse "Tool(glob_pattern)" → extract glob and convert to regex
+            glob_part = pattern
+
+            # Handle legacy format: "Tool(glob_pattern)"
             if "(" in pattern and ")" in pattern:
                 _, glob_part = pattern.split("(", 1)
                 glob_part = glob_part.rstrip(")")
-                regex = glob_part.replace("*", ".*").replace("?", ".")
-                if re.match(f"^{regex}$", resource):
-                    return True
+
+            # Use fnmatch for filename matching (handles ".env*")
+            # Use Path.match() for glob patterns with path separators (handles ".git/*")
+            if fnmatch.fnmatch(filename, glob_part):
+                return True
+
+            # For patterns with path separators, use pathlib's glob matching
+            if "/" in glob_part or "\\" in glob_part:
+                try:
+                    if resource_path.match(glob_part):
+                        return True
+                except (ValueError, TypeError):
+                    pass
+
         return False
 
     def without_agent_spawn(self) -> "PermissionScope":
