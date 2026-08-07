@@ -223,7 +223,12 @@ class TerminalUI:
             return False  # Fail closed: deny by default on any error
 
     def _validate_questions(self, questions: Optional[list]) -> list:
-        """Ensure questions structure is valid, return safe default if not."""
+        """Ensure questions structure is valid, return safe default if not.
+
+        Preserves `header` (used as the tab label) and `overview` (used as the
+        picker's intro line) alongside question/options — dropping them here is
+        what previously forced tabs to fall back to "Question 1/2/…".
+        """
         if not questions or not isinstance(questions, list):
             return [{"question": "No question provided", "options": []}]
         validated = []
@@ -233,10 +238,19 @@ class TerminalUI:
             opts = q.get("options", [])
             if not isinstance(opts, list):
                 opts = []
-            validated.append({
+            entry = {
                 "question": q.get("question", "Question"),
                 "options": opts,
-            })
+            }
+            header = q.get("header") or q.get("label")
+            if header:
+                entry["header"] = str(header)
+            overview = q.get("overview")
+            if overview:
+                entry["overview"] = str(overview)
+            if q.get("multiSelect") is not None:
+                entry["multiSelect"] = bool(q.get("multiSelect"))
+            validated.append(entry)
         return validated or [{"question": "No question provided", "options": []}]
 
     # ── AskUserQuestion interactive picker ─────────────────────────────────
@@ -762,14 +776,16 @@ class TerminalUI:
         """Calculate dynamic height of the processing/task-board area.
 
         Mirrors render_processing_indicator output shape:
-          - 1 line for header (* Blinking... or blank)
-          - 1 line for |_ tree connector
-          - 1 line per visible task
+          - 1 line for the ✳ Running… header (always present while processing)
+          - when a task board exists: +1 line for the |_ tree connector
+            and +1 line per visible task
 
-        Returns 0 when no processing area is needed.
+        Returns 0 only when idle.
         """
-        if not self._is_processing or not self._task_board:
+        if not self._is_processing:
             return 0
+        if not self._task_board:
+            return 1
         return 2 + len(self._task_board)
 
     def render_layout(self) -> Layout:
@@ -1082,8 +1098,9 @@ class TerminalUI:
                     new_show = (self._spinner_frame // 4) % 2 == 0
                     if new_show != self._show_indicator:
                         self._show_indicator = new_show
-                        if self._task_board:
-                            self._dirty = True
+                        # The ✳ Running… header renders whenever processing,
+                        # task board or not — so always repaint on toggle.
+                        self._dirty = True
 
                 # Task board: collapse 2s after all tasks complete
                 self._age_completed_tasks()

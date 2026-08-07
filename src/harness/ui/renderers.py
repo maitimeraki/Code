@@ -317,25 +317,32 @@ class OutputRenderer:
         show_indicator: bool,
         tasks: Optional[list] = None,
     ) -> Text:
-        """Render * Blinking... + |_ + task list in processing area when tasks exist.
+        """Render ✳ Running… + optional |_ task list in the processing area.
 
-        When tasks exist and is_processing:
-          - * Blinking... header toggles on/off with show_indicator (both blink together)
-          - |_ tree connector always visible
-          - Task checkboxes: □ pending, ■ running, ■ strikethrough done
-        When no tasks or not processing: returns empty Text.
+        While is_processing:
+          - ✳ glyph always renders; only the "Running…" label toggles between
+            bright and dim with show_indicator. Keeping the glyph outside the
+            toggle holds the row at a fixed height, so the input bar below it
+            never shifts as the label blinks.
+          - When tasks exist: |_ tree connector + task checkboxes underneath
+            (□ pending, ■ running, ■ strikethrough done).
+          - When no tasks exist: the single ✳ Running… line renders alone.
+        When not processing: returns empty Text.
         """
         result = Text()
         if not is_processing:
             return result
+
+        # Header: ✳ always drawn; label dims rather than vanishing.
+        result.append("✳ ", style=Styles.TASK_DOT_BROWN)
+        result.append(
+            "Running…",
+            style=Styles.WORKING_SOLID if show_indicator else Styles.WORKING_BLINK,
+        )
+        result.append("\n")
+
         if not tasks:
             return result
-
-        # Header: * Blinking... (both toggle with show_indicator for blink effect)
-        if show_indicator:
-            result.append("* ", style=Styles.TASK_DOT_BROWN)
-            result.append("Blinking...", style=Styles.WORKING_BLINK)
-        result.append("\n")
 
         # Tree connector
         result.append("|_\n", style=Styles.OPTION_DETAIL)
@@ -499,7 +506,7 @@ class OutputRenderer:
 
         # ── Tabs row ────────────────────────────────────────────
         if not submitted:
-            tab_labels = [q.get("label", f"Question {i+1}")
+            tab_labels = [q.get("header") or q.get("label") or f"Question {i+1}"
                           for i, q in enumerate(questions)]
             tab_labels.append("Submit")
             for ti, label in enumerate(tab_labels):
