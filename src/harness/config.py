@@ -23,12 +23,42 @@ _DEFAULT_ENV_BLOCK = {
 }
 
 
+def get_default_permissions() -> dict:
+    """Default permission config for new users (Claude Code model).
+
+    allow: Tools allowed everywhere (no approval, no pattern checking)
+    ask: Tools requiring approval for all operations (no pattern checking)
+    deny: Tools with specific path patterns to block (denied on matching paths, allowed elsewhere)
+    patterns: Glob patterns for deny list
+
+    Note: A tool can be in both allow and deny. The deny patterns override.
+    """
+    return {
+        "allow": [
+            "Read", "Glob", "Grep", "Skill",
+            "AskUserQuestion", "TaskCreate", "TaskGet",
+            "TaskList", "TaskOutput", "TaskUpdate", "TaskStop"
+        ],
+        "ask": ["Write", "Edit", "Bash"],
+        "deny": ["Read", "Write", "Edit"],
+        "patterns": {
+            "Read": [".env*", ".git/*"],
+            "Write": [".git/*", ".code/*"],
+            "Edit": [".env*", ".git/*"]
+        },
+        "defaultMode": "auto",
+        "alwaysAsk": []
+    }
+
+
 def load_settings_file() -> dict[str, Any]:
     """Load entire settings.json file once at startup, cache it.
 
     Returns all fields (env, hooks, permissions, enabledPlugins, etc.)
     dynamically. As user adds new fields over time, they work automatically.
     Reads from disk only once per process; subsequent calls return cached copy.
+
+    On first creation, initializes with default permissions (allow/ask/deny lists).
     """
     global _settings_file_cache
     if _settings_file_cache is not None:
@@ -40,14 +70,21 @@ def load_settings_file() -> dict[str, Any]:
     if settings_path.exists():
         try:
             with open(settings_path, "r", encoding="utf-8") as f:
-                _settings_file_cache = json.load(f)  
+                _settings_file_cache = json.load(f)
         except (json.JSONDecodeError, OSError):
             print("Line:44")
-            _settings_file_cache = {"env": dict(_DEFAULT_ENV_BLOCK)}
+            _settings_file_cache = {
+                "env": dict(_DEFAULT_ENV_BLOCK),
+                "permissions": get_default_permissions()
+            }
     else:
-        _settings_file_cache = {"env": dict(_DEFAULT_ENV_BLOCK)}
-        print("Line:48")
+        _settings_file_cache = {
+            "env": dict(_DEFAULT_ENV_BLOCK),
+            "permissions": get_default_permissions()  # Initialize defaults on first creation
+        }
+        print("Line:56")
         try:
+            settings_path.parent.mkdir(parents=True, exist_ok=True)
             settings_path.write_text(json.dumps(_settings_file_cache, indent=2))
         except OSError:
             pass
