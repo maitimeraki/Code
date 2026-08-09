@@ -21,25 +21,61 @@ class DefinitionMeta:
 
 
 class DefinitionRegistry:
-    """Scan frontmatter-only, lazy-load full body with mtime-invalidated cache."""
+    """Scan frontmatter-only, lazy-load full body with mtime-invalidated cache.
+
+    Scans the project agents/skills dir plus any namespaced scan roots added
+    via :meth:`add_scope_root` (e.g. marketplace plugins). Namespaced entries
+    are indexed under ``<prefix>-<name>`` so plugins from different marketplaces
+    never collide with the base roster or each other.
+    """
 
     def __init__(self, dir_getter: Callable[[], Path], kind: str):
         self._dir_getter = dir_getter
         self.kind = kind
         self._index: Dict[str, DefinitionMeta] = {}
         self._body_cache: Dict[str, Tuple[float, str]] = {}
+        self._extra_roots: list[tuple[Path, str]] = []
+
+    def add_scope_root(self, directory: Path, prefix: str = "") -> None:
+        """Register an extra scan root (e.g. an installed plugin's agents/ dir).
+
+        Entries are surfaced under ``{prefix}-{name}`` so a plugin from one
+        marketplace can never shadow a different ``architect`` from another.
+        A ``prefix`` of ``""`` surfaces entries under their bare name.
+        """
+        self._extra_roots.append((directory, prefix))
+        self.scan()
 
     def scan(self) -> None:
-        """(Re)build the lightweight index. Reads ONLY frontmatter bytes per file."""
-        directory = self._dir_getter()
-        self._index.clear()
-        if not directory.exists():
-            return
+        """(Re)build the lightweight index across all registered roots.
 
-        for path in sorted(directory.glob("*.md")):
-            meta = self._parse_frontmatter_only(path)
-            if meta is not None:
-                self._index[meta.name] = meta
+        The base dir is scanned flat (``*.md``); namespaced extra roots are
+        scanned recursively so nested skill files (``skills/<name>/SKILL.md``)
+        are also picked up.
+        """
+        self._index.clear()
+        for directory, prefix in self._iter_roots():
+            if not directory.exists():
+                continue
+            pattern = "**/*.md" if prefix else "*.md"
+            for path in sorted(directory.glob(pattern)):
+                meta = self._parse_frontmatter_only(path)
+                if meta is None:
+                    continue
+                name = f"{prefix}-{meta.name}" if prefix else meta.name
+                self._index[name] = DefinitionMeta(
+                    name=name,
+                    description=meta.description,
+                    path=path,
+                    mtime=meta.mtime,
+                    tools=meta.tools,
+                    model=meta.model,
+                )
+
+    def _iter_roots(self) -> list[tuple[Path, str]]:
+        roots = [(self._dir_getter(), "")]
+        roots.extend(self._extra_roots)
+        return roots
 
     def _parse_frontmatter_only(self, path: Path) -> Optional[DefinitionMeta]:
         """Reads line-by-line; stops at closing '---'. Body is never read here."""
