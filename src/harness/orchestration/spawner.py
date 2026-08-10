@@ -1,6 +1,7 @@
 """Agent spawner with multi-LLM fallback support and real tool-calling loop."""
 
 import asyncio
+import time
 from typing import Optional, Callable, TYPE_CHECKING
 from datetime import datetime
 import platform
@@ -11,12 +12,13 @@ import uuid
 from .agent import AgentConfig, AgentResult, AgentStatus, AgentType
 from .llm_client import LLMClient, TextDelta, ToolCallsReady, StreamDone
 from harness.core.verifier import resolve_verifier
-from harness.tools.definitions import get_tools_payload, validate_args, TOOL_REGISTRY
+from harness.tools.definitions import get_tools_payload, resolve_tool_definition, validate_call_args
 from harness.tools.factory import build_scoped_router
 from harness.tools.executor import ToolExecutor
+from harness.tools.models import ToolStatus
 from harness.tools.output_cap import cap_output
 from harness.config import get_settings
-from pydantic import ValidationError
+from harness.plugins.loader import collect_plugin_catalog
 
 if TYPE_CHECKING:
     from harness.ui.stream_listener import StreamListener
@@ -110,7 +112,43 @@ date: {datetime.now().strftime('%Y-%m-%d')}
 {skill_lines}
 </available_skills>""")
 
+        # Installed plugins: cheap state-file counts (no disk scan). Tells the
+        # orchestrator which plugins' commands/instructions/rules it can pull
+        # on demand via the PluginContext tool.
+        plugins = collect_plugin_catalog()
+        if plugins:
+            plugin_lines = "\n".join(
+                f"- {p['name']}: {p['commands']} commands, "
+                f"{p['instructions']} instructions, {p['rules']} rules"
+                for p in plugins
+            )
+            parts.append(f"""<available_plugins>
+{plugin_lines}
+</available_plugins>""")
+
     return "\n\n".join(parts)
+
+
+async def _render_pending_tasks(session_id: str) -> Optional[str]:
+    """Render this session's unfinished tasks, or None if there are none.
+
+    Without this the model only sees tasks it created in the current turn, so on
+    the next prompt it reports nothing pending even though the rows exist.
+    """
+    from sqlalchemy import select
+    from harness.persistence.database import get_session
+    from harness.persistence.models import UserTask
+
+    async with get_session() as db:
+        rows = (await db.execute(
+            select(UserTask)
+            .where(UserTask.session_id == session_id, UserTask.status != "completed")
+            .order_by(UserTask.created_at)
+        )).scalars().all()
+    if not rows:
+        return None
+    lines = "\n".join(f"- [{r.status}] {r.subject} (id: {r.id})" for r in rows)
+    return f"<pending_tasks>\n{lines}\n</pending_tasks>"
 
 
 def _compose_post_task_reassertion(config: "AgentConfig") -> Optional[str]:
@@ -175,6 +213,7 @@ class AgentSpawner:
         stream_listener: Optional["StreamListener"] = None,
         approval_callback: Optional[Callable] = None,
         ask_user_question_callback: Optional[Callable] = None,
+        mcp_manager=None,
     ):
         self.llm_client = llm_client or LLMClient()
         self.max_parallel_agents = max_parallel_agents or get_settings().max_parallel_agents
@@ -182,16 +221,23 @@ class AgentSpawner:
         self.stream_listener = stream_listener
         self.approval_callback = approval_callback
         self.ask_user_question_callback = ask_user_question_callback
+        self.mcp_manager = mcp_manager
         self.results = {}
 
     async def spawn(
-        self, config: AgentConfig, on_text_delta: Optional[Callable[[str], None]] = None
+        self,
+        config: AgentConfig,
+        on_text_delta: Optional[Callable[[str], None]] = None,
+        on_turn_end: Optional[Callable[[], None]] = None,
     ) -> AgentResult:
         """Spawn agent and execute task with real LLM tool-calling loop.
 
         Args:
             config: Agent configuration with task description and permissions.
             on_text_delta: Optional callback to stream text deltas to UI.
+            on_turn_end: Optional callback fired when a turn ends without a tool
+                call, so the UI can close the open text block. Without it a
+                verifier-rejected turn streams into the previous turn's block.
 
         Returns:
             AgentResult with status, output, and token usage.
@@ -245,6 +291,8 @@ class AgentSpawner:
                 spawn_fn=self.spawn,
                 parent_config=config,
                 ask_user_question_callback=self.ask_user_question_callback,
+                mcp_manager=self.mcp_manager,
+                skill_registry=config.skill_registry,
             )
             executor = ToolExecutor(
                 router,
@@ -278,6 +326,17 @@ class AgentSpawner:
                 except Exception as mem_err:
                     logger.debug("Memory injection skipped", error=str(mem_err))
 
+            # Pending tasks from earlier prompts in this session — the model has no
+            # other way to know they exist. Best-effort: a DB hiccup must not block spawn.
+            session_id = (config.context or {}).get("session_id")
+            if system_content and session_id:
+                try:
+                    tasks_block = await _render_pending_tasks(session_id)
+                    if tasks_block:
+                        system_content = f"{system_content}\n\n{tasks_block}"
+                except Exception as task_err:
+                    logger.debug("Pending-task injection skipped", error=str(task_err))
+
             if system_content:
                 messages.append({"role": "system", "content": system_content})
 
@@ -296,10 +355,37 @@ class AgentSpawner:
             reassertion = _compose_post_task_reassertion(config)
             reassertion_injected = False
 
+            # Per-run lifetime budget — a wall-clock cap on the WHOLE agent run.
+            # This is the knob that now governs sub-agents (they bypass the per-
+            # tool I/O timeout): a 10-20 min task runs to completion, but an
+            # unbounded run is a leak. 0 = no cap.
+            deadline = None
+            if config.timeout_seconds > 0:
+                deadline = time.monotonic() + config.timeout_seconds
+
+            # Stall guard: N consecutive turns repeating an identical tool plan
+            # (same tools, same args) means the agent is spinning, not advancing.
+            # The wall clock bounds total time; this exits a spin far earlier so
+            # the budget isn't burned on one repeated loop.
+            stall_limit = settings.no_progress_limit or 4
+            prev_plan = None
+            stall_streak = 0
+
             # Tool-calling loop
             for iteration in range(config.max_tool_iterations):
                 result.status = AgentStatus.THINKING
                 logger.debug(f"Iteration {iteration + 1}/{config.max_tool_iterations}")
+
+                # Wall-clock guard: stop cleanly (FAILED, not a crash) once the
+                # run exceeds its budget, before triggering another LLM call.
+                if deadline is not None and time.monotonic() >= deadline:
+                    result.status = AgentStatus.FAILED
+                    result.error = (
+                        f"Agent wall-clock budget exceeded ({config.timeout_seconds}s, "
+                        f"{result.iterations} iterations) — stopped to avoid an unbounded run."
+                    )
+                    logger.warning(result.error)
+                    break
 
                 # Before the last permitted turn, re-assert the objective once so
                 # the model closes on its pinned goal rather than drifting.
@@ -418,6 +504,31 @@ class AgentSpawner:
 
                     result.iterations += 1
 
+                    # Stall guard — an identical consecutive tool plan (same tools,
+                    # same serialized args) means the agent is spinning, not
+                    # progressing. Reset on any change; fail once the streak holds.
+                    plan = tuple(sorted(
+                        (tc.name, (
+                            json.dumps(tc.arguments, sort_keys=True)
+                            if isinstance(tc.arguments, (str, dict))
+                            else str(tc.arguments)
+                        ))
+                        for tc in tool_calls_this_turn
+                    ))
+                    if plan == prev_plan:
+                        stall_streak += 1
+                    else:
+                        prev_plan = plan
+                        stall_streak = 0
+                    if stall_limit and stall_streak >= stall_limit:
+                        result.status = AgentStatus.FAILED
+                        result.error = (
+                            f"Agent stalled: identical tool plan repeated "
+                            f"{stall_streak} consecutive turns — halting a spin."
+                        )
+                        logger.warning(result.error)
+                        break
+
                     # Check token budget
                     if config.tool_token_budget and result.tokens_used >= config.tool_token_budget:
                         result.status = AgentStatus.FAILED
@@ -471,6 +582,8 @@ class AgentSpawner:
                             ),
                         })
                         result.iterations += 1
+                        if on_turn_end:
+                            on_turn_end()
                         continue
 
                     result.status = AgentStatus.COMPLETED
@@ -607,30 +720,36 @@ class AgentSpawner:
             )
 
         try:
-            # Map name to ToolType
-            tool_type = None
-            for tt, defn in TOOL_REGISTRY.items():
-                if defn.name == tool_call.name:
-                    tool_type = tt
-                    break
-
-            if tool_type is None:
+            # Resolve by LLM-facing name — covers built-ins AND MCP tools.
+            definition = resolve_tool_definition(tool_call.name, executor.router)
+            if definition is None:
                 raise ValueError(f"Unknown tool: {tool_call.name}")
 
-            # Tier 0/1: Validate arguments
+            # Tier 0/1: Validate arguments (pydantic for built-ins, jsonschema for MCP)
             try:
-                validated_args = validate_args(tool_type, tool_call.arguments)
-            except ValidationError as ve:
+                raw = tool_call.arguments
+                if isinstance(raw, str):
+                    raw = json.loads(raw)
+                if not isinstance(raw, dict):
+                    raw = {}
+                validated_args = validate_call_args(tool_call.name, definition, raw)
+            except Exception as ve:
                 tool_error = f"Invalid arguments for {tool_call.name}: {str(ve)}"
                 logger.warning(tool_error)
             else:
                 # Tier 2–4: Execute tool (permission/circuit-breaker handled inside)
-                tool_result = await executor.execute(
-                    tool_type, **validated_args.model_dump()
-                )
+                tool_result = await executor.execute(tool_call.name, **validated_args)
                 tokens = tool_result.tool_call.tokens_used
 
-                if not tool_result.tool_call.success:
+                if tool_result.tool_call.status == ToolStatus.AWAITING_APPROVAL:
+                    # Parked for human approval — not executed. Tell the model clearly
+                    # so it stops retrying and waits for the user instead of treating
+                    # this as a transient failure.
+                    tool_error = (
+                        f"Tool '{tool_call.name}' is pending human approval — it was NOT "
+                        "executed. Ask the user to approve it before retrying."
+                    )
+                elif not tool_result.tool_call.success:
                     tool_error = tool_result.tool_call.error
 
         except Exception as e:
