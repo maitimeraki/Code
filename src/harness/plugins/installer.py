@@ -19,7 +19,7 @@ from datetime import datetime
 from pathlib import Path
 
 from harness.config import (
-    load_settings_file,
+    _writable_settings,
     save_settings_file,
 )
 from harness.plugins.marketplace import fetch_catalog
@@ -158,7 +158,7 @@ class PluginInstaller:
         mcp_servers = _collect_mcp(manifest, source_dir)
         installed_servers: list[str] = []
         if mcp_servers:
-            data = load_settings_file()
+            data = _writable_settings()
             servers = data.setdefault("mcpServers", {})
             for server_name, cfg in mcp_servers.items():
                 key = f"{namespace}-{server_name}"
@@ -233,7 +233,7 @@ class PluginInstaller:
 
         # Remove namespaced MCP servers from settings.json.
         if record.mcp_server_names:
-            data = load_settings_file()
+            data = _writable_settings()
             servers = data.get("mcpServers") or {}
             for sname in record.mcp_server_names:
                 servers.pop(sname, None)
