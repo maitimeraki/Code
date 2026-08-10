@@ -122,14 +122,30 @@ class MemorySearchArgs(BaseModel):
     limit: int = 3
 
 
+class PluginContextArgs(BaseModel):
+    """Arguments for plugin_context tool.
+
+    Fetches installed plugin commands/instructions/rules content on demand.
+    ``plugin`` names a namespaced plugin (``<marketplace>-<name>``) or bare
+    name; empty returns a catalog of everything available.
+    """
+    kind: Literal["commands", "instructions", "rules", "all"] = "all"
+    plugin: str = ""
+
+
 @dataclass
 class ToolDefinition:
-    """Definition of a tool for LLM tool-calling."""
+    """Definition of a tool for LLM tool-calling.
+
+    Built-in tools define a pydantic ``args_model``; dynamically registered MCP
+    tools supply opaque JSON Schema instead (``json_schema``). Exactly one is set.
+    """
     name: str
     tool_type: ToolType
     description: str
-    args_model: Type[BaseModel]
-    permission_kind: Literal["fs_read", "fs_write", "shell", "agent_spawn", "interaction", "skill", "task"]
+    args_model: Optional[Type[BaseModel]] = None
+    json_schema: Optional[dict] = None
+    permission_kind: Literal["fs_read", "fs_write", "shell", "agent_spawn", "interaction", "skill", "task"] = "interaction"
 
 
 # Static tool registry — one entry per tool that has an actual handler.
@@ -858,7 +874,38 @@ Repeated queries within an hour are cached for free.
         args_model=MemorySearchArgs,
         permission_kind="fs_read",
     ),
+    ToolType.PLUGIN_CONTEXT: ToolDefinition(
+        name="PluginContext",
+        tool_type=ToolType.PLUGIN_CONTEXT,
+        description="""Fetch installed plugin commands, instructions, or rules on demand.
+
+The harness loads plugin assets lazily, not eagerly — call this tool when a
+task would benefit from a plugin's guidance (e.g. before following an
+installed command, or when a plugin's instructions/rules may constrain your
+work). Kinds: commands, instructions, rules, or all.
+
+- plugin="" returns a catalog of every installed plugin and the counts/types
+  of assets it ships.
+- plugin=<name> returns the full markdown content of the requested kind for
+  that plugin (commands/instructions/rules), so you can follow its guidance.
+
+Plugin names are namespaced ``<marketplace>-<name>`` (e.g.
+``context-mode-context-mode``). Prefer fetching on demand over assuming you
+know a plugin's contents.
+""",
+        args_model=PluginContextArgs,
+        permission_kind="fs_read",
+    ),
 }
+
+
+def tool_definition_schema(definition: ToolDefinition) -> dict:
+    """Return the raw JSON Schema for a tool's arguments."""
+    if definition.args_model is not None:
+        return definition.args_model.model_json_schema()
+    if definition.json_schema is not None:
+        return definition.json_schema.get("$ref", definition.json_schema) if isinstance(definition.json_schema, dict) and "$ref" in definition.json_schema else definition.json_schema
+    return {"type": "object"}
 
 
 def to_llm_tool_schema(definition: ToolDefinition) -> dict:
@@ -868,7 +915,7 @@ def to_llm_tool_schema(definition: ToolDefinition) -> dict:
         "function": {
             "name": definition.name,
             "description": definition.description,
-            "parameters": definition.args_model.model_json_schema(),
+            "parameters": tool_definition_schema(definition),
         },
     }
 
@@ -877,6 +924,7 @@ def get_tools_payload(router) -> list[dict]:
     """Build tools payload for LLM, filtering to only registered handlers.
 
     For spawn_agent, dynamically appends available agent names+descriptions to the tool description.
+    Also appends any dynamically registered (MCP) tools carried on ``router.mcp_tools``.
     """
     tools = []
     for tool_type in router.handlers.keys():
@@ -885,7 +933,38 @@ def get_tools_payload(router) -> list[dict]:
         definition = TOOL_REGISTRY[tool_type]
         schema = to_llm_tool_schema(definition)
         tools.append(schema)
+
+    # Dynamically registered tools (MCP) — keyed by name, already LLM-facing.
+    for name, definition in getattr(router, "mcp_tools", {}).items():
+        tools.append(to_llm_tool_schema(definition))
     return tools
+
+
+def resolve_tool_definition(name: str, router=None) -> ToolDefinition | None:
+    """Resolve a tool definition by its LLM-facing name (built-in or MCP)."""
+    parts = name.split("__", 2)
+    if len(parts) == 3 and parts[0] == "mcp" and router is not None:
+        mcp_defs = getattr(router, "mcp_tools", {})
+        return mcp_defs.get(name)
+    for tt, defn in TOOL_REGISTRY.items():
+        if defn.name == name:
+            return defn
+    return None
+
+
+def validate_call_args(name: str, definition: ToolDefinition, raw_args: dict) -> dict:
+    """Validate tool arguments against the definition's schema.
+
+    Returns a plain dict. pydantic models are used for built-ins; ``jsonschema``
+    validates opaque MCP JSON Schema. Raises on invalid input.
+    """
+    if definition.args_model is not None:
+        return definition.args_model.model_validate(raw_args).model_dump()
+    if definition.json_schema is not None:
+        import jsonschema
+        jsonschema.validate(instance=raw_args, schema=definition.json_schema)
+        return raw_args
+    return raw_args
 
 
 def validate_args(tool_type: ToolType, raw_args: dict) -> BaseModel:
@@ -897,4 +976,6 @@ def validate_args(tool_type: ToolType, raw_args: dict) -> BaseModel:
         raise ValueError(f"Unknown tool type: {tool_type.value}")
 
     definition = TOOL_REGISTRY[tool_type]
+    if definition.args_model is None:
+        raise ValueError(f"Tool {tool_type.value} has no args model defined")
     return definition.args_model.model_validate(raw_args)

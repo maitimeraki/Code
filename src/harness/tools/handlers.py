@@ -145,30 +145,54 @@ async def ask_user_question(
 ) -> str:
     """Ask the user a multiple-choice question.
 
-    Delegates to the approval/UI callback when available; otherwise returns
-    a structured response so the LLM can proceed on its own judgment.
+    This stub is reached only when the factory has NOT wired a live UI callback
+    (headless/test runs). Raising here is intentional: silently returning a fake
+    "pending" response would cause the model to believe the question was shown and
+    answered, producing invisible data corruption.
     """
-    import json
-    payload = {
-        "questions": questions or [],
-        "multi_select": multi_select,
-        "preview": preview,
-    }
-    # ponytail: approval_callback wired by factory when available
-    return json.dumps({"asked": True, "payload": payload, "pending": True})
+    raise RuntimeError(
+        "AskUserQuestion requires a live UI callback and cannot run headless. "
+        "Wire a UI callback via build_scoped_router() before calling this tool."
+    )
 
 
-async def execute_skill(skill: str, args: str = "") -> str:
+async def execute_skill(
+    skill: str, args: str = "", skill_registry: Any = None
+) -> str:
     """Execute a named skill.
 
-    Delegates to the skill_registry wired by the factory.
-    Without a registry, returns a structured error so the LLM adapts.
+    Loads the skill's body via the skill_registry wired by the factory and
+    returns it so the LLM can follow its SKILL.md instructions (the same way a
+    skill is "run" by name). Without a registry, returns a structured error so
+    the LLM adapts.
     """
     import json
-    return json.dumps({"skill": skill, "args": args, "executed": False, "reason": "Skill registry not available in this scope"})
+    if skill_registry is None:
+        return json.dumps({"skill": skill, "args": args, "executed": False, "reason": "Skill registry not available in this scope"})
+    try:
+        body = skill_registry.get_full(skill)
+    except KeyError:
+        available = ", ".join(sorted(s.name for s in skill_registry.list_skills()))
+        return json.dumps({"skill": skill, "args": args, "executed": False, "reason": f"Unknown skill. Available: {available}"})
+    return json.dumps({"skill": skill, "args": args, "executed": True, "body": body})
 
 
 # ── Task management handlers ──────────────────────────────────────────────
+#
+# Tasks live in the `user_tasks` table keyed by session_id, so a task created on
+# one prompt is still pending on the next and survives a restart.
+
+_VALID_TASK_STATUS = ("pending", "in_progress", "completed")
+
+
+def _task_row_to_dict(row) -> dict:
+    return {
+        "id": row.id,
+        "subject": row.subject,
+        "description": row.description or "",
+        "activeForm": row.active_form or "",
+        "status": row.status,
+    }
 
 
 async def task_create(
@@ -176,22 +200,58 @@ async def task_create(
     description: str = "",
     active_form: str = "",
     metadata: dict | None = None,
+    session_id: str = "",
 ) -> str:
     """Create a new task."""
     import json
-    return json.dumps({"created": True, "subject": subject, "id": "pending"})
+    from uuid import uuid4
+    from harness.persistence.database import get_session
+    from harness.persistence.models import UserTask
+
+    task_id = uuid4().hex
+    async with get_session() as db:
+        db.add(UserTask(
+            id=task_id,
+            session_id=session_id,
+            subject=subject,
+            description=description,
+            active_form=active_form,
+            status="pending",
+            metadata_json=metadata or {},
+        ))
+        await db.commit()
+    return json.dumps({"created": True, "id": task_id, "subject": subject, "status": "pending"})
 
 
-async def task_get(task_id: str) -> str:
+async def task_get(task_id: str, session_id: str = "") -> str:
     """Retrieve task details by ID."""
     import json
-    return json.dumps({"task_id": task_id, "found": False, "reason": "Task manager not available in this scope"})
+    from sqlalchemy import select
+    from harness.persistence.database import get_session
+    from harness.persistence.models import UserTask
+
+    async with get_session() as db:
+        row = (await db.execute(
+            select(UserTask).where(UserTask.id == task_id)
+        )).scalar_one_or_none()
+    if row is None:
+        return json.dumps({"task_id": task_id, "found": False, "reason": "No such task"})
+    return json.dumps({"found": True, **_task_row_to_dict(row)})
 
 
-async def task_list(status: str | None = None) -> str:
+async def task_list(status: str | None = None, session_id: str = "") -> str:
     """List tasks, optionally filtered by status."""
     import json
-    return json.dumps({"tasks": [], "filter": status})
+    from sqlalchemy import select
+    from harness.persistence.database import get_session
+    from harness.persistence.models import UserTask
+
+    query = select(UserTask).where(UserTask.session_id == session_id)
+    if status:
+        query = query.where(UserTask.status == status)
+    async with get_session() as db:
+        rows = (await db.execute(query.order_by(UserTask.created_at))).scalars().all()
+    return json.dumps({"tasks": [_task_row_to_dict(r) for r in rows], "filter": status})
 
 
 async def task_output(task_id: str, block: bool = True, timeout: int = 60000) -> str:
@@ -212,10 +272,38 @@ async def task_update(
     subject: str | None = None,
     description: str | None = None,
     metadata: dict | None = None,
+    session_id: str = "",
 ) -> str:
     """Update a task's status, details, or metadata."""
     import json
-    return json.dumps({"task_id": task_id, "updated": True, "status": status})
+    from sqlalchemy import select
+    from harness.persistence.database import get_session
+    from harness.persistence.models import UserTask
+
+    if status is not None and status not in _VALID_TASK_STATUS:
+        return json.dumps({
+            "task_id": task_id,
+            "updated": False,
+            "reason": f"status must be one of {list(_VALID_TASK_STATUS)}",
+        })
+
+    async with get_session() as db:
+        row = (await db.execute(
+            select(UserTask).where(UserTask.id == task_id)
+        )).scalar_one_or_none()
+        if row is None:
+            return json.dumps({"task_id": task_id, "updated": False, "reason": "No such task"})
+        if status is not None:
+            row.status = status
+        if subject is not None:
+            row.subject = subject
+        if description is not None:
+            row.description = description
+        if metadata is not None:
+            row.metadata_json = metadata
+        await db.commit()
+        payload = _task_row_to_dict(row)
+    return json.dumps({"updated": True, **payload})
 
 
 # ── Spawn agent handler factory ───────────────────────────────────────────
@@ -260,7 +348,10 @@ def _build_child_config(
         project_context=parent_config.project_context,
         is_orchestrator=False,
         agent_registry=None,
-        skill_registry=None,
+        # Children share the parent's skill registry so the Skill tool they are
+        # advertised (and the LLM can invoke on demand) actually resolves bodies
+        # instead of erroring "registry not available in this scope".
+        skill_registry=parent_config.skill_registry,
         permission_scope=child_scope,
         spawn_depth=parent_config.spawn_depth + 1,
         model=parent_config.model,
@@ -327,7 +418,8 @@ def make_spawn_agent_handler(
                 "note": "Running in background — results are not collected.",
             })
 
-        # Sub-agents are strict executors — no roster, no skills, no re-delegation.
+        # Sub-agents are strict executors — no roster, no re-delegation. They do
+        # share the parent's skill registry, so skills remain callable on demand.
         result = await spawn_fn(child_config)
 
         # Structured return so the orchestrator ingests a capsule, not a transcript.
@@ -469,3 +561,79 @@ async def memory_search(query: str, source: str = "all", limit: int = 3) -> str:
         return f"No results found for: {query}"
 
     return "".join(results)
+
+
+# ── Plugin context (commands/instructions/rules on demand) ────────────────
+
+
+def _plugin_asset_files(pdir: Path, kind: str) -> list[Path]:
+    """Return sorted ``*.md`` files under a plugin's kind subdir (commands/instructions/rules)."""
+    sub = pdir / kind
+    if not sub.is_dir():
+        return []
+    return sorted(sub.rglob("*.md"))
+
+
+async def plugin_context(kind: str = "all", plugin: str = "") -> str:
+    """Fetch installed plugin commands/instructions/rules content on demand.
+
+    Plugins are loaded lazily — this tool is how the model pulls the content in
+    when a task actually needs it. With no ``plugin`` it returns a catalog of
+    every installed plugin and the assets each ships. With ``plugin`` + a kind
+    it returns the full markdown bodies so the model can follow the plugin's
+    guidance.
+    """
+    import json
+    from harness.plugins.state import installed_plugins_dir, load_state
+
+    installed = (load_state().get("installed") or {})
+    if not installed:
+        return json.dumps({"plugins": [], "note": "No plugins installed"})
+
+    def _dir(rec: dict) -> tuple[str, Path]:
+        rec_name = rec.get("name", "")
+        namespace = rec.get("marketplace") or rec_name
+        return f"{namespace}-{rec_name}", installed_plugins_dir() / namespace / rec_name
+
+    # Catalog mode: enumerate every installed plugin's assets.
+    if not plugin:
+        catalog = []
+        for rec in installed.values():
+            label, pdir = _dir(rec)
+            catalog.append({
+                "plugin": label,
+                "commands": [f.name for f in _plugin_asset_files(pdir, "commands")],
+                "instructions": [f.name for f in _plugin_asset_files(pdir, "instructions")],
+                "rules": [f.name for f in _plugin_asset_files(pdir, "rules")],
+            })
+        return json.dumps({"plugins": catalog})
+
+    # Resolve the target plugin dir from a namespaced or bare name. The name is
+    # matched against installed records only — never treated as a filesystem path.
+    target_dir = None
+    for rec in installed.values():
+        label, pdir = _dir(rec)
+        if plugin in (label, rec.get("name", "")):
+            target_dir = pdir
+            break
+    if target_dir is None:
+        available = ", ".join(_dir(rec)[0] for rec in installed.values())
+        return json.dumps({
+            "plugin": plugin, "found": False,
+            "reason": f"Unknown plugin. Available: {available}. Omit `plugin` to see the catalog.",
+        })
+
+    if kind not in ("commands", "instructions", "rules", "all"):
+        return json.dumps({
+            "plugin": plugin, "found": False,
+            "reason": "kind must be one of: commands, instructions, rules, all",
+        })
+
+    payload: dict = {"plugin": plugin, "found": True}
+    for k in (["commands", "instructions", "rules"] if kind == "all" else [kind]):
+        files = _plugin_asset_files(target_dir, k)
+        payload[k] = {
+            "files": [f.name for f in files],
+            "contents": [f.read_text(encoding="utf-8", errors="replace") for f in files],
+        }
+    return json.dumps(payload)

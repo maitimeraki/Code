@@ -6,6 +6,7 @@ from datetime import datetime
 import structlog
 
 from .models import ToolCall, ToolType, ToolStatus, ToolResult, ToolBudget
+from .permissions import ApprovalRequired
 
 logger = structlog.get_logger(__name__)
 
@@ -15,13 +16,15 @@ class ToolRouter:
 
     def __init__(self):
         self.budget = ToolBudget()
-        self.handlers: Dict[ToolType, Callable] = {}
+        self.handlers: Dict[str, Callable] = {}
+        # Dynamically registered (MCP) tool definitions, keyed by LLM name.
+        self.mcp_tools: Dict[str, Any] = {}
         self.call_history: list[ToolCall] = []
 
-    def register_handler(self, tool_type: ToolType, handler: Callable) -> None:
-        """Register a tool handler."""
+    def register_handler(self, tool_type: str, handler: Callable) -> None:
+        """Register a tool handler keyed by its LLM-facing name."""
         self.handlers[tool_type] = handler
-        logger.info(f"Registered handler for {tool_type.value}")
+        logger.info(f"Registered handler for {getattr(tool_type, 'value', tool_type)}")
 
     async def call(
         self,
@@ -41,29 +44,35 @@ class ToolRouter:
             if not self.budget.has_budget:
                 raise RuntimeError("Token budget exhausted")
 
-            # Check handler exists
+            tool_name = tool_type if isinstance(tool_type, str) else getattr(tool_type, "value", str(tool_type))
+
+            # Unified dispatch: built-in and MCP tools (mcp__server__tool) are both
+            # registered in self.handlers by factory.build_scoped_router().
             if tool_type not in self.handlers:
-                raise ValueError(f"Unknown tool: {tool_type.value}")
+                raise ValueError(f"Unknown tool: {tool_name}")
 
-            # Execute tool
             handler = self.handlers[tool_type]
-            logger.info(f"Calling {tool_type.value}", args=kwargs)
-
+            logger.info(f"Calling {tool_name}", args=kwargs)
             result = await handler(**kwargs)
 
             tool_call.status = ToolStatus.SUCCESS
             tool_call.result = result
             tool_call.tokens_used = len(str(result).split())
 
+        except ApprovalRequired:
+            # Not an execution failure — permission gate wants human approval.
+            # Re-raise so the executor parks the call as AWAITING_APPROVAL.
+            raise
+
         except asyncio.TimeoutError:
             tool_call.status = ToolStatus.TIMEOUT
             tool_call.error = "Tool execution timed out"
-            logger.warning(f"Timeout for {tool_type.value}")
+            logger.warning(f"Timeout for {getattr(tool_type, 'value', tool_type)}")
 
         except Exception as e:
             tool_call.status = ToolStatus.FAILED
             tool_call.error = str(e)
-            logger.error(f"Tool failed: {tool_type.value}", error=str(e))
+            logger.error(f"Tool failed: {getattr(tool_type, 'value', tool_type)}", error=str(e))
 
         finally:
             tool_call.completed_at = datetime.now()

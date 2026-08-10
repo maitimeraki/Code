@@ -6,18 +6,26 @@ from typing import Optional, Any, Dict
 from datetime import datetime
 
 
-class ToolType(Enum):
-    """Supported tool types."""
+class ToolType(str, Enum):
+    """Built-in tool types.
+
+    Subclasses str so members are interchangeable with the plain tool-name
+    strings used for dynamically registered (MCP/plugin) tools: routers,
+    registries and permission checks are all keyed by str.
+
+    Values MUST equal the LLM-facing name in TOOL_REGISTRY, since that name is
+    what the model sends back and what permission rules match on.
+    """
     READ = "Read"
     WRITE = "Write"
     EDIT = "Update"
     BASH = "Bash"
-    GREP = "Pattern"
-    GLOB = "Search"
+    GREP = "Grep"
+    GLOB = "Glob"
     GIT = "Git"
     HTTP = "HTTP"
     SPAWN_AGENT = "Agent"
-    ATTEMPT_COMPLETION = "Is_completion"
+    ATTEMPT_COMPLETION = "Completion"
     ASK_USER_QUESTION = "AskUserQuestion"
     SKILL = "Skill"
     TASK_CREATE = "TaskCreate"
@@ -27,6 +35,7 @@ class ToolType(Enum):
     TASK_STOP = "TaskStop"
     TASK_UPDATE = "TaskUpdate"
     MEMORY_SEARCH = "MemorySearch"
+    PLUGIN_CONTEXT = "PluginContext"
 
 
 class ToolStatus(Enum):
