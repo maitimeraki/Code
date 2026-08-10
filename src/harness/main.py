@@ -1,13 +1,14 @@
 """CLI entry point using Typer."""
 
 import asyncio
+import sys
 from pathlib import Path
 from typing import Optional
 # Typer is a library that turns Python functions into CLI commands
 import typer
 from rich.console import Console
 
-from harness.config import get_settings
+from harness.config import get_settings, update_mcp_server, remove_mcp_server, load_settings_file
 from harness.logging import configure_logging, get_logger
 from harness.core.task_manager import TaskStateManager
 from harness.core.loop import LoopController
@@ -21,12 +22,24 @@ logger = get_logger(__name__)
 
 def main() -> None:
     """Main entry point - always launch UI with optional auto-execution."""
-    import sys
+    # Windows legacy consoles (cp1252) cannot encode ✓/✗ used throughout the CLI.
+    # Force UTF-8 so Rich renders them everywhere (CI, pipes, and ttys alike).
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except (AttributeError, OSError):
+        pass
+
     settings = get_settings()
     configure_logging(settings.log_level)
 
     # Parse CLI args to extract command info (if any)
     command_info = _parse_command_args(sys.argv[1:])
+
+    # Non-interactive commands that exit without launching the app
+    if command_info and command_info["command"] in {"mcp", "plugin"}:
+        _run_registry_command(command_info)
+        return
 
     # Always launch the app (with optional command to auto-execute)
     app_instance = HarnessApp(auto_command=command_info)
@@ -51,6 +64,67 @@ def _parse_command_args(args: list[str]) -> Optional[dict]:
         return None
 
     command = args[0]
+
+    if command == "mcp":
+        # subcommands: add NAME --command CMD [--args ...] [--env K=V ...], remove NAME, list
+        action = args[1] if len(args) > 1 else "list"
+        if action == "add" and len(args) >= 2:
+            name = args[2] if len(args) > 2 else None
+            sub = {}
+            i = 3
+            while i < len(args):
+                if args[i] == "--command" and i + 1 < len(args):
+                    sub["command"] = args[i + 1]
+                elif args[i] == "--url" and i + 1 < len(args):
+                    sub["url"] = args[i + 1]
+                elif args[i] == "--args" and i + 1 < len(args):
+                    sub["args"] = args[i + 1].split(",")
+                elif args[i] == "--env" and i + 1 < len(args):
+                    env = {}
+                    for pair in args[i + 1].split(","):
+                        if "=" in pair:
+                            k, v = pair.split("=", 1)
+                            env[k.strip()] = v.strip()
+                    sub["env"] = env
+                i += 1
+            if name and ("command" in sub or "url" in sub):
+                return {"command": "mcp", "action": "add", "name": name, "config": sub}
+        elif action == "remove" and len(args) > 2:
+            return {"command": "mcp", "action": "remove", "name": args[2]}
+        return {"command": "mcp", "action": action}
+
+    elif command == "plugin":
+        action = args[1] if len(args) > 1 else "list"
+        if action == "marketplace":
+            sub = args[2] if len(args) > 2 else "list"
+            if sub == "add" and len(args) > 3:
+                source = args[3]
+                alias = None
+                i = 4
+                while i < len(args):
+                    if args[i] == "--alias" and i + 1 < len(args):
+                        alias = args[i + 1]
+                        i += 2
+                    else:
+                        i += 1
+                return {
+                    "command": "plugin",
+                    "action": "marketplace",
+                    "sub": sub,
+                    "target": source,
+                    "alias": alias,
+                }
+            if sub == "remove" and len(args) > 3:
+                return {
+                    "command": "plugin",
+                    "action": "marketplace",
+                    "sub": sub,
+                    "target": args[3],
+                }
+            return {"command": "plugin", "action": "marketplace", "sub": sub}
+        if action in {"install", "uninstall"} and len(args) > 2:
+            return {"command": "plugin", "action": action, "target": args[2]}
+        return {"command": "plugin", "action": action}
 
     if command == "run":
         task_desc = None
@@ -115,6 +189,148 @@ def _parse_command_args(args: list[str]) -> Optional[dict]:
             return {"command": "approve", "approval_id": approval_id, "decision": decision, "reason": reason}
 
     return None
+
+
+def _run_registry_command(command_info: dict) -> None:
+    """Handle `harness mcp ...` and `harness plugin ...` without launching the TUI."""
+    command = command_info["command"]
+
+    if command == "mcp":
+        action = command_info.get("action", "list")
+        if action == "add":
+            name = command_info.get("name")
+            config = command_info.get("config")
+            if not name or not config:
+                console.print("[yellow]Usage:[/yellow] harness mcp add <name> --command <cmd> [--args a,b] [--env K=V]")
+                console.print("[yellow]  or:[/yellow] harness mcp add <name> --url <url>")
+                return
+            update_mcp_server(name, config)
+            console.print(
+                f"[bold green]✓[/bold green] MCP server "
+                f"[bold]{command_info['name']}[/bold] registered in settings.json"
+            )
+            console.print("  Restart the harness (or plugin install) to load it.")
+        elif action == "remove":
+            removed = remove_mcp_server(command_info["name"])
+            if removed:
+                console.print(
+                    f"[bold green]✓[/bold green] MCP server "
+                    f"[bold]{command_info['name']}[/bold] removed from settings.json"
+                )
+            else:
+                console.print(
+                    f"[red]✗[/red] MCP server [bold]{command_info['name']}[/bold] not found"
+                )
+        else:  # list
+            servers = load_settings_file().get("mcpServers", {}) or {}
+            console.print("[bold]Configured MCP Servers:[/bold]")
+            if not servers:
+                console.print("  (none)")
+            for name, cfg in servers.items():
+                transport = cfg.get("command") or cfg.get("url") or "?"
+                console.print(f"  - {name}  ({transport})")
+
+    elif command == "plugin":
+        action = command_info.get("action", "list")
+
+        if action == "marketplace":
+            _plugin_marketplace_command(command_info)
+            return
+
+        from harness.plugins import PluginInstaller
+
+        installer = PluginInstaller()
+
+        if action == "install":
+            target = command_info["target"]
+            from_marketplace = "@" in target and not Path(target).exists()
+            try:
+                if from_marketplace:
+                    name, _, alias = target.partition("@")
+                    record = installer.install_from_marketplace(name, alias)
+                else:
+                    record = installer.install(Path(target))
+            except ValueError as exc:
+                console.print(f"[red]✗[/red] {exc}")
+                return
+            console.print(
+                f"[bold green]✓[/bold green] Plugin [bold]{record.name}[/bold] "
+                f"v{record.version} installed"
+            )
+            if record.agent_names:
+                console.print(f"  Agents: {', '.join(record.agent_names)}")
+            if record.skill_names:
+                console.print(f"  Skills: {', '.join(record.skill_names)}")
+            if record.command_names:
+                console.print(f"  Commands: {', '.join(record.command_names)}")
+            if record.instruction_names:
+                console.print(f"  Instructions: {', '.join(record.instruction_names)}")
+            if record.rule_names:
+                console.print(f"  Rules: {', '.join(record.rule_names)}")
+            if record.mcp_server_names:
+                console.print(f"  MCP servers: {', '.join(record.mcp_server_names)}")
+            console.print("  Restart the harness to load the plugin.")
+        elif action == "uninstall":
+            removed = installer.uninstall(command_info["target"])
+            if removed:
+                console.print(
+                    f"[bold green]✓[/bold green] Plugin "
+                    f"[bold]{command_info['target']}[/bold] uninstalled"
+                )
+            else:
+                console.print(
+                    f"[red]✗[/red] Plugin [bold]{command_info['target']}[/bold] not installed"
+                )
+        else:  # list
+            records = installer.list_installed()
+            console.print("[bold]Installed Plugins:[/bold]")
+            if not records:
+                console.print("  (none)")
+            for rec in records:
+                counts = (
+                    f"({len(rec.agent_names)}a {len(rec.skill_names)}s "
+                    f"{len(rec.command_names)}c {len(rec.instruction_names)}i "
+                    f"{len(rec.rule_names)}r {len(rec.mcp_server_names)}m)"
+                )
+                console.print(f"  - {rec.name} v{rec.version}  {counts}")
+
+
+def _plugin_marketplace_command(command_info: dict) -> None:
+    """Handle `harness plugin marketplace add/remove/list`."""
+    from harness.config import URLFetchError
+    from harness.plugins.marketplace import MarketplaceRegistry
+
+    registry = MarketplaceRegistry()
+    sub = command_info.get("sub", "list")
+
+    if sub == "add":
+        try:
+            record = registry.add(command_info["target"], command_info.get("alias"))
+        except (ValueError, URLFetchError) as exc:
+            console.print(f"[red]✗[/red] Could not register marketplace: {exc}")
+            return
+        console.print(
+            f"[bold green]✓[/bold green] Marketplace [bold]{record.name}[/bold] "
+            f"registered (cloned to {record.path})"
+        )
+    elif sub == "remove":
+        removed = registry.remove(command_info["target"])
+        if removed:
+            console.print(
+                f"[bold green]✓[/bold green] Marketplace "
+                f"[bold]{command_info['target']}[/bold] removed"
+            )
+        else:
+            console.print(
+                f"[red]✗[/red] Marketplace [bold]{command_info['target']}[/bold] not found"
+            )
+    else:  # list
+        records = registry.list()
+        console.print("[bold]Registered Marketplaces:[/bold]")
+        if not records:
+            console.print("  (none)")
+        for rec in records:
+            console.print(f"  - {rec.name}  ({rec.path})")
 
 
 @app.command()
