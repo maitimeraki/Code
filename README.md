@@ -1,371 +1,214 @@
-# Agent Harness
+# Harness
 
-Self-improving agent orchestration system with autonomous loop execution, parallel agent spawning, and multi-LLM support. Built like Claude Code with extensible tool calling, persistent knowledge graph, and checkpoint/resume capability.
+**Self-improving, multi-agent orchestration system that runs autonomous coding agents in your terminal with loops, checkpoint/resume, parallel agents, a tool-calling system, MCP support, and persistent memory.**
 
-## Features
+Built like Claude Code: an interactive Rich terminal UI plus a full CLI, all in one installable Python package (Python ≥ 3.11).
 
-- **Autonomous Loops** - Execute long-running tasks with automatic checkpointing and resume capability
-- **Parallel Agents** - Spawn up to 16 concurrent agents with automatic fallback between LLMs
-- **Multi-LLM Support** - Switch between Claude, OpenAI, Azure seamlessly via litellm
-- **Rich Terminal UI** - Real-time progress with Rich-based dashboard and command palette
-- **Persistent Knowledge** - NetworkX-backed knowledge graph for cross-session learning
-- **Tool Orchestration** - Unified interface for file operations, code execution, and external APIs
-- **Database Flexibility** - SQLite for development, PostgreSQL/Supabase in production
+---
 
-## Quick Start
+## What is this?
 
-### Installation
+Harness is a production-ready foundation for building and running **autonomous agents** long-running tasks that plan, use tools, spawn sub-agents, iterate, and resume from where they left off.
+
+Instead of sitting at a prompt asking for permission at every step, your agent executes a task loop: it runs iterations, calls tools, spawns parallel agents, records what it learned, and checkpoints after every step. Interrupted or out of tokens? Pick it back up with one command — it resumes without re-doing completed work.
+
+| Layer | What it does |
+|-------|--------------|
+| **Loop engine** | Runs tasks autonomously with automatic checkpoint/resume per iteration |
+| **Agent orchestration** | Spawns up to 16 concurrent agents with automatic fallback between LLMs |
+| **Multi-LLM** | Claude, OpenAI, or Azure through one interface (litellm) |
+| **Tool calling** | Unified file / code / shell / HTTP execution with timeouts, retries, and output spilling |
+| **MCP + plugins** | Register any Model Context Protocol server or install marketplace plugins — stored in `settings.json` |
+| **Terminal UI** | Real-time Rich dashboard with command palette and live agent/tool state |
+| **Memory** | NetworkX-backed knowledge graph + SQL database for cross-session learning |
+| **Human approval** | Risky tool calls pause and wait for `harness approve` / `harness approvals` |
+
+## How it helps you
+
+- **Trust your agent to grind.** Long tasks run unattended; checkpoints mean a crash or context limit is a `resume`, not a restart.
+- **Parallelize the boring work.** Fan out independent sub-tasks across up to 16 agents at once, with automatic LLM fallback if one provider fails.
+- **Extend without forking.** Point any MCP server at it (`harness mcp add`) or pull plugins from a marketplace no code changes.
+- **Decide what's safe.** Risk-gated tool calls queue as approval requests you can review and approve/reject from the CLI.
+- **Learn across sessions.** Past solutions are stored in a knowledge graph and injected into future prompts.
+- **One package, two surfaces.** Launch the full terminal UI or script the exact same engine from the CLI.
+
+---
+
+## Quick Start (install → running in ~60 seconds)
+
+### 0. Prerequisites
+
+- **Python 3.11+** (`python --version`), **git**
+
+### 1. Install
+
+**Unix / macOS / Git Bash:**
 
 ```bash
-# Clone repository
-git clone <repo-url>
-cd code
-
-# Install in development mode
-pip install -e .
-
-# Install with dev dependencies (testing, type checking, linting)
-pip install -e ".[dev]"
-
-# Initialize project (creates .env, directories)
-harness init
+git clone <repo-url> code && cd code
+python -m venv .venv && source .venv/bin/activate
+pip install -e . && harness init
 ```
 
-### Running
+**Windows (PowerShell / cmd):**
 
-**Interactive Terminal UI (default):**
+```powershell
+git clone <repo-url> code; cd code
+python -m venv .venv
+.\.venv\Scripts\activate
+pip install -e .; harness init
+```
+
+Prefer a single line (Unix/macOS/Git Bash):
+
 ```bash
-python -m harness.main
+git clone <repo-url> code && cd code && python -m venv .venv && source .venv/bin/activate && pip install -e . && harness init
 ```
 
-Launches a Rich-based terminal with command palette, real-time output streaming, and live agent state tracking.
+That's it — `harness init` creates your config file and data directories automatically.
 
-**CLI Mode (specific operations):**
+### 2. Provide an API key
+
+Set one of these (it's read at launch):
+
 ```bash
-# Run a task autonomously
-harness run --task "Build a REST API with authentication"
-
-# Resume from checkpoint
-harness resume --task-id <task-id>
-
-# Check task status
-harness status --task-id <task-id>
-
-# Search knowledge graph
-harness knowledge-search "auth patterns"
+export CODE_API_KEY="sk-ant-..."      # Claude / Anthropic (default)
+# or: export OPENAI_API_KEY="sk-..."  # OpenAI
+# or: export AZURE_API_KEY="..."      # Azure
 ```
 
-### Configuration
+Or, instead of exporting, create a `.env` in the project root:
 
-Create `.env` after running `harness init`:
-
-```env
-# LLM API Keys (at least one required)
-ANTHROPIC_API_KEY=sk-ant-...
-OPENAI_API_KEY=sk-...
-AZURE_API_KEY=...
-
-# Database
-DATABASE_URL=sqlite+aiosqlite:///harness.db
-# For PostgreSQL/Supabase:
-# DATABASE_URL=postgresql+asyncpg://user:pass@host/db
-
-# Optional
-REDIS_URL=redis://localhost:6379
-MAX_PARALLEL_AGENTS=16
-TOOL_TIMEOUT_SECONDS=30
-LOG_LEVEL=info
 ```
+CODE_API_KEY=sk-ant-...
+```
+
+### 3. Run your first task
+
+```bash
+harness run --task "Build a REST API with authentication" --max-iterations 20
+```
+
+Or launch the interactive terminal UI, then type tasks in the prompt:
+
+```bash
+harness
+```
+
+### Verify it works
+
+```bash
+harness status          # → shows your in-progress / completed tasks
+harness knowledge-search "auth patterns"   # → searches learned context
+```
+
+---
+
+## CLI Reference
+
+| Command | What it does |
+|---------|--------------|
+| `harness` | Launch the interactive Rich terminal UI |
+| `harness run --task "..." [--max-iterations N]` | Run a task autonomously through the loop |
+| `harness resume --task-id <id>` | Resume a task from its last checkpoint |
+| `harness status` | List all tasks and their progress |
+| `harness knowledge-search <query> [--limit N]` | Search past solutions in the knowledge graph |
+| `harness approvals [--task-id <id>]` | List pending human-approval requests |
+| `harness approve <approval-id> [--reject] [--reason "..."]` | Approve / reject a queued risky action |
+| `harness init` | Create `settings.json` + data directories |
+| `harness mcp add <name> --command <cmd>` | Register an MCP server (stdin/stdout) |
+| `harness mcp add <name> --url <url>` | Register an MCP server (HTTP) |
+| `harness mcp remove <name>` / `harness mcp list` | Remove / list registered MCP servers |
+| `harness plugin install <path-or-name@version>` | Install a plugin (or from a marketplace) |
+| `harness plugin uninstall <name>` / `harness plugin list` | Remove / list installed plugins |
+| `harness plugin marketplace add <source>` | Register a plugin marketplace (git URL) |
+
+---
+
+## Configuration
+
+All configuration lives in **`settings.json`** (Claude-Code style), created by `harness init` and resolved project-first, then user-level (`~/.code/`) — with a `.env` file as a fallback. MCP servers and plugins you add are stored right here.
+
+```json
+{
+  "env": {
+    "CODE_BASE_URL": "https://api.anthropic.com",
+    "CODE_API_KEY": "env:CODE_API_KEY"
+  },
+  "model": "claude-3-5-sonnet-20241022",
+  "subagent_model": "claude-3-5-haiku-20241022",
+  "mcpServers": {}
+}
+```
+
+Key environment variables:
+
+| Variable | Purpose | Default |
+|----------|---------|---------|
+| `CODE_API_KEY` | Claude / Anthropic API key (base URL overrideable via `CODE_BASE_URL`) | `https://api.anthropic.com` |
+| `OPENAI_API_KEY` | OpenAI API key | — |
+| `AZURE_API_KEY` | Azure API key | — |
+| `DATABASE_URL` | `sqlite+aiosqlite:///harness.db` (dev) or `postgresql+asyncpg://...` (prod) | SQLite |
+| `MAX_PARALLEL_AGENTS` | Concurrent agent cap | `16` |
+| `TOOL_TIMEOUT_SECONDS` | Per-tool execution timeout | `30` |
+
+---
 
 ## Architecture
 
-**5-Layer Design** (3000-4000 LOC total):
+**5-layer design** — files mirror this layout under `src/harness/`.
 
-### 1. Loop Engine (`src/harness/core/`)
-Autonomous task execution with checkpoint/resume.
+| Layer | Module | Responsibility |
+|-------|--------|----------------|
+| **1. Loop Engine** | `core/` | `LoopController` async loop, `TaskStateManager` checkpoint/resume, `CompletionChecker`, error memory |
+| **2. Orchestration** | `orchestration/` | `HarnessOrchestrator` coordinates agents + tools + prompts; `AgentSpawner` runs up to 16 in parallel |
+| **3. Tool Calling** | `tools/` | `ToolRouter` → handlers; `ToolExecutor` wraps timeout + retries; `output_cap` spills huge outputs to cache; `mcp_manager` bridges MCP servers |
+| **4. Prompting** | `prompts/` | Jinja2 templates, `context_injector` BM25-ranked context, token/role constraints |
+| **5. State & Memory** | `persistence/` | NetworkX + SQLAlchemy knowledge graph, session state, `database` pooling, `transient_cache` |
 
-| File | Purpose |
-|------|---------|
-| `loop.py` | `LoopController` - Async iteration with state persistence |
-| `task_manager.py` | `TaskStateManager` - Checkpoints, resume, state tracking |
-| `models.py` | `TaskState` - Serializable task state |
-| `completion.py` | `CompletionChecker` - Success criteria evaluation |
-| `error_memory.py` | Error tracking and retry logic |
+**Terminal UI** (`ui/`): concurrent input loop + `Rich.Live` display (rendering → keyboard → live streams → agent/tool state → command actions), so output streams with zero flicker.
 
-**Pattern:** Loop persists state after each iteration. Tasks resume from checkpoint without re-executing completed work.
+**Key patterns:** everything is async (`asyncio`); state persists after every loop iteration; agents run in a `TaskGroup` with automatic LLM fallback; large tool outputs spill to a persistent cache and return a reference.
 
-### 2. Agent Orchestration (`src/harness/orchestration/`)
-Parallel multi-agent coordination with LLM fallback.
-
-| File | Purpose |
-|------|---------|
-| `orchestrator.py` | `HarnessOrchestrator` - Coordinates agents + tools + prompts |
-| `spawner.py` | `AgentSpawner` - Spawns agents concurrently (up to 16) |
-| `agent.py` | `AgentConfig`, `AgentResult` - Agent configuration and results |
-
-**Pattern:** Orchestrator delegates work to agents, collects results, manages timeouts and retries.
-
-### 3. Tool Calling (`src/harness/tools/`)
-Unified interface for file operations, code execution, API calls.
-
-| File | Purpose |
-|------|---------|
-| `router.py` | `ToolRouter` - Routes tool calls to handlers |
-| `executor.py` | `ToolExecutor` - Wraps execution with timeout + retry |
-| `handlers.py` | Tool-specific handlers (file, code, shell, http) |
-| `models.py` | `ToolCall`, `ToolResult` - Request/response format |
-| `factory.py` | Tool definition factory |
-| `output_cap.py` | Output spilling for oversized results |
-
-**Pattern:** Tools return `ToolResult(status, output, metadata)`. Large outputs are spilled to persistent cache.
-
-### 4. Prompt Optimization (`src/harness/prompts/`)
-Role-based prompt generation with context injection.
-
-| File | Purpose |
-|------|---------|
-| `engine.py` | `PromptEngine` - Renders templates with context |
-| `context_injector.py` | BM25-ranked context retrieval |
-| `constraints.py` | Token budget and role-specific constraints |
-
-**Pattern:** Prompts are Jinja2 templates with injected context from knowledge graph.
-
-### 5. State & Memory (`src/harness/persistence/`)
-Persistent knowledge graph and session state.
-
-| File | Purpose |
-|------|---------|
-| `knowledge_graph.py` | Query/store past solutions (NetworkX + DB) |
-| `session.py` | `SessionManager` - Session state persistence |
-| `models.py` | SQLAlchemy ORM definitions |
-| `database.py` | Connection pool and migrations |
-| `transient_cache.py` | In-memory cache for tool output |
-
-**Pattern:** All state flows through database. NetworkX graph enables pattern recognition across sessions.
-
-### Terminal UI (`src/harness/ui/`)
-Real-time progress tracking with Rich.
-
-| Phase | Purpose |
-|-------|---------|
-| 2A | Rendering - Rich components, layout styling |
-| 2B | Keyboard input - Keybinds, command palette |
-| 2C | Real-time streams - Log aggregation, output streaming |
-| 2D | Agent state - Agent view, tool results display |
-| 2E | Command actions - Execute user commands |
-
-**Pattern:** Concurrent input loop + display loop with `Rich.Live` (no flickering).
-
-## Tech Stack
-
-| Layer | Technology | Performance |
-|-------|-----------|-------------|
-| Loop | asyncio + uvloop + msgpack | <2s spawn, <5ms writes |
-| Agents | litellm + TaskGroup | 16 parallel, auto fallback |
-| Tools | httpx + aiofiles + Redis | <100ms calls, 100-1000x cache |
-| Prompts | Jinja2 + BM25 | <50ms generation |
-| Persistence | SQLAlchemy + PostgreSQL | 10k+ qps |
-| UI | Rich (Live + Console) | <50ms render |
+---
 
 ## Development
 
-### Common Tasks
-
 ```bash
-# Run tests with coverage
+# Install dev tooling (pytest, ruff, black, mypy)
+pip install -e ".[dev]"
+
+# Test with coverage (target ≥80%)
 pytest -v --cov=src/harness
 
-# Run specific test
-pytest tests/test_loop.py::test_checkpoint -v
-
-# Type checking
-mypy src/harness
-
-# Linting
+# Lint / type-check / format
 ruff check src/
-
-# Format code
+mypy src/harness
 black src/ tests/
 
-# Debug mode (verbose logging)
+# Debug logging (verbose) — run the TUI or a task with full logs
 LOG_LEVEL=debug python -m harness.main
 ```
 
-### Adding a New Tool
+**Extending the harness:**
 
-1. Define handler in `src/harness/tools/handlers.py`
-2. Register in `ToolRouter` (auto-discovered from handlers)
-3. Return `ToolResult(status, output, metadata)`
+- **New tool** → add a `@tool_handler("name")` in `src/harness/tools/handlers.py`, return `ToolResult(status, output, metadata)`; it's auto-discovered.
+- **New agent type** → extend `AgentConfig` in `orchestration/agent.py`, implement in `AgentSpawner.spawn()`, add a Jinja2 prompt in `prompts/`.
+- **New MCP server** → `harness mcp add <name> --command <cmd>`; it's persisted in `settings.json`.
+- Suggested flow: research existing solutions first → plan → write tests (TDD) → review → commit (conventional commits).
 
-```python
-@tool_handler("my_tool")
-async def handle_my_tool(params: dict) -> ToolResult:
-    # Implementation
-    return ToolResult(
-        status="success",
-        output="Result here",
-        metadata={"key": "value"}
-    )
-```
-
-### Adding a New Agent Type
-
-1. Extend `AgentConfig` in `src/harness/orchestration/agent.py`
-2. Implement in `AgentSpawner.spawn()`
-3. Add Jinja2 template in `src/harness/prompts/`
-
-### Testing
-
-**Write tests first (TDD):**
-```bash
-pytest tests/test_my_feature.py -v
-```
-
-**Check coverage:**
-```bash
-pytest --cov=src/harness --cov-report=html
-# Open htmlcov/index.html
-```
-
-Target: 80%+ coverage.
-
-## Configuration & Paths
-
-Follows **Claude Code standard** with project-level and user-level overrides.
-
-### Directory Resolution
-
-```
-Project-level (explicit override):
-./.code/
-├── agents/     # Project-specific agents
-├── skills/     # Project-specific skills
-├── data/       # Project task checkpoints
-├── templates/  # Project prompt templates
-└── config/     # Project config
-
-User-level (default, auto-created):
-~/.code/
-├── agents/
-├── skills/
-├── data/
-├── templates/
-└── config/
-```
-
-**In code:**
-```python
-from harness.config import get_settings
-
-settings = get_settings()
-agents_path = settings.get_agents_dir()    # ./.code/agents or ~/.code/agents
-data_path = settings.get_data_dir()        # ./.code/data or ~/.code/data
-```
-
-**Priority:** Project-level paths (if exist) override user-level paths.
-
-## Key Design Patterns
-
-### Async-First
-All I/O (database, files, APIs) is async. Use `asyncio.run()` for CLI entry points.
-
-### Checkpoint/Resume
-`TaskStateManager` persists complete task state after each loop iteration:
-```python
-# Resume doesn't re-execute completed steps
-await loop.resume(task_id)
-```
-
-### Parallel Agents with Fallback
-`AgentSpawner` manages concurrent execution with automatic LLM fallback:
-```python
-# If Claude fails, try OpenAI automatically
-agents = await spawner.spawn(count=4, fallback_models=["gpt-4", "gpt-3.5"])
-```
-
-### Tool Output Spilling
-Large tool outputs are stored in persistent cache, not returned directly:
-```python
-# If output > cap, store in cache and return reference
-result = ToolResult(output="...", metadata={"spilled": True, "cache_key": "abc123"})
-```
-
-### Context Injection
-Prompts include ranked context from knowledge graph (BM25):
-```python
-# Relevant past solutions automatically injected into prompt
-prompt = await engine.render("task", context=injector.get_context("auth"))
-```
-
-## Debugging
-
-### Enable Verbose Logging
-```bash
-LOG_LEVEL=debug python -m harness.main
-```
-
-### Check Database State
-```bash
-sqlite3 harness.db
-SELECT * FROM tasks ORDER BY created_at DESC;
-SELECT * FROM tool_calls WHERE task_id = '<id>';
-```
-
-### Monitor Task Execution
-- TUI shows real-time logs in main panel
-- Check `.code/data/` for checkpoint files
-- Exceptions logged to `.code/logs/` (if configured)
-
-### UI Not Rendering?
-- Ensure `TerminalUI.run()` is awaited (async context)
-- Check Rich console for rendering errors
-- Verify `auto_refresh=True` in Live display
-
-## Dependencies
-
-**Core runtime:**
-- asyncio, aiofiles, httpx, msgpack
-
-**Multi-LLM:**
-- litellm (Claude, OpenAI, Azure, others)
-
-**Database:**
-- SQLAlchemy, asyncpg (PostgreSQL), aiosqlite (SQLite)
-
-**UI:**
-- Rich (terminal styling, Live display)
-
-**Prompts:**
-- Jinja2, rank-bm25 (context ranking)
-
-**Orchestration:**
-- asyncio.TaskGroup (Python 3.11+)
-
-**Monitoring:**
-- structlog, prometheus-client
-
-See `pyproject.toml` for exact versions.
+---
 
 ## Contributing
 
-1. **Research first** - Check existing implementations before new code
-2. **Plan** - Use `/plan` skill for complex features
-3. **TDD** - Write tests before implementation
-4. **Review** - Use `/code-review` skill after writing
-5. **Commit** - Conventional commits format (feat:, fix:, etc.)
+1. **Research first** — check for existing implementations before writing new code
+2. **Plan** — use `/plan` for complex features
+3. **TDD** — write tests before implementation
+4. **Review** — use `/code-review` after writing
+5. **Commit** — conventional commits (`feat:`, `fix:`, …)
 
-See CLAUDE.md for detailed workflows.
+See `CLAUDE.md` for detailed architecture, path resolution, and workflows.
 
 ## License
 
 MIT
-
-## Support
-
-- **Documentation:** See CLAUDE.md for architecture details, paths, debugging
-- **Issues:** GitHub issues for bugs, feature requests
-- **Development:** `pip install -e ".[dev]"` for local setup
-
----
-
-**Built for Claude Code.** Extensible, observable, and designed for autonomous agent workflows.
