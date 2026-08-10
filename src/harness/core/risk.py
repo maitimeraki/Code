@@ -34,6 +34,12 @@ def classify_risk(
         "low" or "high" risk level.
     """
     try:
+        # Fail closed: a dynamically registered MCP tool is third-party code we
+        # haven't vetted — always route it through the approval gate unless the
+        # operator explicitly allows it in permissions.
+        if isinstance(tool_type, str) and tool_type.startswith("mcp__"):
+            return "high"
+
         if tool_type == ToolType.BASH:
             command = args.get("command", "").strip()
             if not command:

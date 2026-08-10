@@ -180,19 +180,46 @@ async def check_and_execute_once(
                 return (False, executed.result_json, executed.error)
             return (True, executed.result_json, None)
 
-    # Execute the tool
-    try:
-        result = await executor_fn(idempotency_key)
+    # Optimistic insert: claim ownership before calling the executor.
+    # A second concurrent caller that also passed the idempotency check above will
+    # hit the unique constraint here and be routed to the "already executed" branch,
+    # preventing double-execution without any explicit distributed lock.
+    from sqlalchemy.exc import IntegrityError
 
-        # Record execution in ledger
+    try:
         async with get_session() as db_session:
-            executed_action = ExecutedAction(
+            placeholder = ExecutedAction(
                 idempotency_key=idempotency_key,
                 task_id=task_id,
-                result_json=result if isinstance(result, dict) else {"result": str(result)},
+                result_json=None,
+                error=None,
                 executed_at=datetime.now(),
             )
-            db_session.add(executed_action)
+            db_session.add(placeholder)
+            await db_session.commit()
+    except IntegrityError:
+        # Another concurrent caller inserted first — re-read their result.
+        async with get_session() as db_session:
+            executed = await db_session.get(ExecutedAction, idempotency_key)
+        if executed is not None:
+            if executed.error:
+                return (False, executed.result_json, executed.error)
+            # If result_json is still None the other caller is mid-execution; treat
+            # as "pending" so the loop can retry later rather than silently succeed.
+            if executed.result_json is None:
+                return (False, None, "Concurrent execution in progress; retry later")
+            return (True, executed.result_json, None)
+        return (False, None, "Concurrent execution detected; result unavailable")
+
+    # We own the execution — run the tool and update the placeholder with the outcome.
+    try:
+        result = await executor_fn(idempotency_key)
+        result_json = result if isinstance(result, dict) else {"result": str(result)}
+
+        async with get_session() as db_session:
+            record = await db_session.get(ExecutedAction, idempotency_key)
+            if record is not None:
+                record.result_json = result_json
             await db_session.commit()
 
         logger.info(
@@ -205,15 +232,10 @@ async def check_and_execute_once(
     except Exception as e:
         error_msg = str(e)
 
-        # Record failure in ledger
         async with get_session() as db_session:
-            executed_action = ExecutedAction(
-                idempotency_key=idempotency_key,
-                task_id=task_id,
-                error=error_msg,
-                executed_at=datetime.now(),
-            )
-            db_session.add(executed_action)
+            record = await db_session.get(ExecutedAction, idempotency_key)
+            if record is not None:
+                record.error = error_msg
             await db_session.commit()
 
         logger.error(
