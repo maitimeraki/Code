@@ -168,16 +168,16 @@ class PluginInstaller:
 
         # 5. Record installation in state.
         record = InstalledPlugin(
-            name=plugin_name,
-            version=manifest.version,
-            marketplace=namespace,
-            agent_names=agent_names,
-            skill_names=skill_names,
-            command_names=command_names,
-            instruction_names=instruction_names,
-            rule_names=rule_names,
-            mcp_server_names=installed_servers,
-            installed_at=datetime.now().isoformat(timespec="seconds"),
+                name=plugin_name,
+                version=manifest.version,
+                marketplace=namespace,
+                agent_names=agent_names,
+                skill_names=skill_names,
+                command_names=command_names,
+                instruction_names=instruction_names,
+                rule_names=rule_names,
+                mcp_server_names=installed_servers,
+                installed_at=datetime.now().isoformat(timespec="seconds"),
         )
         installed[plugin_name] = record.to_dict()
         save_state(state)
