@@ -6,6 +6,7 @@ import signal
 import time
 from collections import OrderedDict
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Optional, TYPE_CHECKING
 from rich.layout import Layout
 from rich.live import Live
@@ -18,11 +19,11 @@ from .header import Header
 from .state import UIState
 from .keybinds import KeybindMap, KeyCode
 from .input_handler import InputHandler, KeyEvent
-from .command_palette import CommandPalette
+from .command_palette import Command, CommandPalette
 from .command_actions import CommandActions
 from .stream_listener import StreamListener, LogEntry
 from .stream_aggregator import StreamAggregator
-from .renderers import OutputRenderer
+from .renderers import OutputRenderer, option_text, APPROVAL_OPTIONS
 from .claude_code_style import Styles
 
 if TYPE_CHECKING:
@@ -40,6 +41,10 @@ _SUBAGENT_GUTTERS = [
     ("┊", "#4ade80"),   # soft green
     ("╎", "#fbbf24"),   # amber
 ]
+
+# Letter shortcuts → approval option, hoisted so every keypress doesn't rebuild
+# the dict. Single source of truth stays in renderers.APPROVAL_OPTIONS.
+_APPROVAL_SHORTCUTS = {opt["key"]: opt for opt in APPROVAL_OPTIONS}
 
 
 class TerminalUI:
@@ -82,6 +87,12 @@ class TerminalUI:
         self.keybinds = KeybindMap()
         self.input_handler = InputHandler(self.keybinds)
         self.command_palette = CommandPalette()
+
+        # Command palette interaction state (open/query/selection index).
+        # Drives the palette overlay rendered in the picker slot. Ctrl+K toggles.
+        self._palette_open = False
+        self._palette_query = ""
+        self._palette_index = 0
 
         # Phase 2C: Real-time streams
         self.stream_listener = StreamListener()
@@ -127,6 +138,12 @@ class TerminalUI:
         # Pending approvals: list of ApprovalRequest rows from DB, polled each render
         self._pending_approvals: list = []
         self._current_approval_idx: int = 0
+        # Focus index within the current approval's vertical option list (↑↓/1-5/Enter).
+        self._approval_focus_idx: int = 0
+        # approval_id → asyncio.Future for each live approval prompt. The executor
+        # blocks on handle_approval_request until the Y/N/A/S/P picker resolves
+        # this future with the human's decision string.
+        self._approval_futures: dict[str, asyncio.Future] = {}
 
         # Pending question interactive picker
         self._pending_question: Optional[dict] = None
@@ -194,33 +211,114 @@ class TerminalUI:
         """Return the handle_approval_request coroutine for orchestrator wiring."""
         return self.handle_approval_request
 
-    async def handle_approval_request(self, action: str, tool: str, risk_level: str = "medium") -> bool:
-        """Handle approval request from orchestrator.
+    async def handle_approval_request(self, action, tool: str, risk_level: str = "medium") -> Optional[str]:
+        """Block on the human's approval decision via the Y/N/A/S/P picker.
 
-        Returns True if approved, False otherwise.
+        Renders the approval in the picker area and WAITS — the executor's tool
+        call does not continue until the human presses Y/N/A/S/P (or the
+        configured approval_timeout_seconds elapses). Returns the decision the
+        executor maps to an outcome:
+          - "approved" / "approved_session" / "persist" → execute the call
+          - "denied" / "denied_session"                → fail the call
+          - None (headless, no live UI)                → park as AWAITING_APPROVAL
         SECURITY: Fails CLOSED — denies on any system error (never approve if safety check fails).
         """
-        from harness.core.approval_manager import create_approval_request, approve_request
+        from uuid import uuid4
+        from datetime import datetime
+        from harness.persistence.database import get_session
+        from harness.persistence.models import ApprovalRequest
+        from harness.config import get_settings
         import logging
 
         try:
-            req = await create_approval_request(
-                action=action,
-                tool=tool,
+            # A concurrent request for the SAME call (model retry before the human
+            # decides, or two agents racing) joins the in-flight future instead of
+            # stacking a duplicate picker prompt.
+            #
+            # Use a stable SHA-256 fingerprint of the action dict so that serialised
+            # and re-parsed copies of the same action compare equal, not just
+            # identical Python dict objects.
+            import hashlib
+            import json as _json
+
+            def _action_fingerprint(a) -> str:
+                if isinstance(a, dict):
+                    return hashlib.sha256(
+                        _json.dumps(a, sort_keys=True, default=str).encode()
+                    ).hexdigest()
+                return hashlib.sha256(str(a).encode()).hexdigest()
+
+            incoming_fp = _action_fingerprint(action)
+
+            for aid, fut in self._approval_futures.items():
+                if fut.done():
+                    continue
+                for a in self._pending_approvals:
+                    if getattr(a, "approval_id", None) == aid:
+                        existing_fp = _action_fingerprint(getattr(a, "proposed_action", None))
+                        if existing_fp == incoming_fp:
+                            return await self._wait_for_decision(fut, get_settings())
+
+            req = ApprovalRequest(
+                approval_id=uuid4().hex,
+                proposed_action=action,
+                status="pending",
+                idempotency_key=uuid4().hex,
                 risk_level=risk_level,
-                status="pending"
+                summary=f"Execute tool: {tool}",
+                created_at=datetime.now(),
             )
+            async with get_session() as db:
+                db.add(req)
+                await db.commit()
+
             self._pending_approvals.append(req)
+            self._current_approval_idx = 0
+            self._approval_focus_idx = 0
             self._dirty = True
 
-            await approve_request(req.id, approved=True)
-            return True
+            future: asyncio.Future = asyncio.Future()
+            self._approval_futures[req.approval_id] = future
+
+            return await self._wait_for_decision(future, get_settings())
         except Exception as e:
             logging.error(f"SECURITY: Approval system failed for tool '{tool}': {str(e)}", exc_info=True)
             self.main_panel.add_error(
                 f"⚠️  Approval system error for {tool}. Tool execution BLOCKED for safety."
             )
-            return False  # Fail closed: deny by default on any error
+            return "denied"  # Fail closed: deny by default on any error
+
+    async def _wait_for_decision(self, future: asyncio.Future, settings) -> str:
+        """Await the picker's decision, applying the timeout+action policy.
+
+        On timeout the pending approval is resolved via approval_timeout_action
+        ("deny" default, "approve" opt-in) so the executor never hangs and never
+        double-prompts.
+        """
+        timeout_seconds = settings.approval_timeout_seconds
+        try:
+            if timeout_seconds > 0:
+                decision = await asyncio.wait_for(future, timeout=timeout_seconds)
+            else:
+                decision = await future
+            return decision
+        except asyncio.TimeoutError:
+            approval = None
+            for aid, f in self._approval_futures.items():
+                if f is future:
+                    for a in self._pending_approvals:
+                        if getattr(a, "approval_id", None) == aid:
+                            approval = a
+                            break
+                    break
+            if approval is not None:
+                decision = (
+                    "approved" if settings.approval_timeout_action == "approve"
+                    else "denied"
+                )
+                await self._finish_approval(approval, decision)
+                return decision
+            return "denied"
 
     def _validate_questions(self, questions: Optional[list]) -> list:
         """Ensure questions structure is valid, return safe default if not."""
@@ -369,13 +467,19 @@ class TerminalUI:
                 for qi in range(len(qs)):
                     cv = state["custom_values"].get(qi, "").strip()
                     if cv:
-                        collected[str(qi)] = cv
+                        answer = cv
                     else:
+                        answer = ""
                         sel = state["selections"].get(qi)
                         if sel is not None:
                             opts = qs[qi].get("options", [])
                             if 0 <= sel < len(opts):
-                                collected[str(qi)] = opts[sel].get("title", "")
+                                answer = option_text(opts[sel], sel + 1)
+                    if answer:
+                        collected[str(qi)] = {
+                            "question": qs[qi].get("question", ""),
+                            "answer": answer,
+                        }
                 state["answers"] = collected
                 if state["future"] and not state["future"].done():
                     state["future"].set_result({"answers": collected})
@@ -456,6 +560,105 @@ class TerminalUI:
 
     # (old picker helpers removed — replaced by tab-based _handle_picker_key)
 
+    # ── Command palette (Ctrl+K) ──────────────────────────────────────────
+
+    async def _handle_palette_key(self, key: str) -> None:
+        """Route a key to the open command palette."""
+        if key in (KeyCode.ESCAPE.value, "\x1b"):
+            self._palette_open = False
+            self._dirty = True
+            return
+        if key in (KeyCode.ENTER.value, "\r", "\n"):
+            self._palette_open = False
+            results = self.command_palette.search(self._palette_query)
+            if results and 0 <= self._palette_index < len(results):
+                cmd = results[self._palette_index]
+                if cmd.handler:
+                    await cmd.handler()
+            self._dirty = True
+            return
+        if key in (KeyCode.UP.value, "k"):
+            results = self.command_palette.search(self._palette_query)
+            if results:
+                self._palette_index = (self._palette_index - 1) % len(results)
+            self._dirty = True
+            return
+        if key in (KeyCode.DOWN.value, "j"):
+            results = self.command_palette.search(self._palette_query)
+            if results:
+                self._palette_index = (self._palette_index + 1) % len(results)
+            self._dirty = True
+            return
+        if key in (KeyCode.BACKSPACE.value, "\x7f", KeyCode.CTRL_H.value):
+            self._palette_query = self._palette_query[:-1]
+            self._palette_index = 0
+            self._dirty = True
+            return
+        if key and len(key) == 1 and key.isprintable():
+            self._palette_query += key
+            self._palette_index = 0
+            self._dirty = True
+
+    def _render_palette(self, width: int) -> Text:
+        """Render the command palette overlay: query line + filtered results."""
+        results = self.command_palette.search(self._palette_query)
+        visible = results[:8] if results else []
+        lines = [
+            Text("Command Palette", style=Styles.HEADER_TITLE),
+            Text(f": {self._palette_query}▌", style=Styles.AI),
+        ]
+        if not visible:
+            lines.append(Text("No matching commands", style=Styles.TOOL_DOT_ERROR))
+        else:
+            for i, cmd in enumerate(visible):
+                style = Styles.PICKER_FOCUS if i == self._palette_index else Styles.PICKER_NORMAL
+                prefix = "▸ " if i == self._palette_index else "  "
+                desc = f"  {cmd.description}" if cmd.description else ""
+                lines.append(Text(f"{prefix}{cmd.shortcut:<16}{desc}", style=style))
+        return Text("\n".join(str(l) for l in lines))
+
+    def mount_plugin_commands(self, commands: list) -> int:
+        """Mount plugin slash-commands into the palette.
+
+        Each ``{name, description, path, plugin}`` entry (from
+        ``harness.plugins.loader.collect_plugin_commands``) becomes a palette
+        command ``:<name>`` whose handler reads the command body (COMMAND.md)
+        on demand and renders it as markdown. Returns the number mounted.
+        """
+        mounted = 0
+        for entry in commands or []:
+            name = entry.get("name", "")
+            if not name:
+                continue
+            path = Path(entry.get("path", ""))
+            plugin = entry.get("plugin", "")
+            description = entry.get("description", "") or f"Plugin command from {plugin}"
+
+            async def handler(path=path, plugin=plugin):
+                try:
+                    content = path.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    self.main_panel.add_error(
+                        f"Failed to read plugin command from {plugin}: {path}"
+                    )
+                    self._dirty = True
+                    return
+                self.main_panel.add_text(
+                    OutputRenderer.render_block("command", content, markdown=True)
+                )
+                self._dirty = True
+
+            self.command_palette.register(
+                Command(
+                    name=f"{name} ({plugin})",
+                    description=description,
+                    shortcut=f":{name}",
+                    handler=handler,
+                )
+            )
+            mounted += 1
+        return mounted
+
     # ── Task board helpers ─────────────────────────────────────────────────
 
     def _ensure_task_board(self, tasks: Optional[list] = None) -> None:
@@ -472,6 +675,41 @@ class TerminalUI:
         self._task_board_dirty = True
         self._dirty = True
         self._refresh_task_board()
+
+    def _process_task_event(self, tool_name: str, data: dict) -> None:
+        """Update the task board from a task-management tool event.
+
+        TaskCreate's REAL id comes from its result event (the call-start event
+        only carries the LLM's args, no id). TaskUpdate carries the real id in
+        its args and must update the entry TaskCreate made — keyed by that id so
+        the subject survives. Fabricating a board id on the TaskCreate call-start
+        event was the bug: later TaskUpdate (real UUID) missed the fabricated key
+        and created a bogus "Untitled / in_progress" entry.
+        """
+        if tool_name == "TaskCreate":
+            result_raw = data.get("result")
+            if result_raw:
+                try:
+                    parsed = json.loads(result_raw)
+                except (json.JSONDecodeError, TypeError):
+                    parsed = {}
+                if isinstance(parsed, dict) and parsed.get("id"):
+                    self._update_task({
+                        "task_id": parsed["id"],
+                        "subject": parsed.get("subject", "Untitled"),
+                        "status": parsed.get("status", "pending"),
+                        "active_form": parsed.get("active_form", ""),
+                    })
+        elif tool_name == "TaskUpdate" and data.get("args"):
+            self._update_task(data["args"])
+        elif tool_name == "TaskList" and data.get("result"):
+            try:
+                parsed = json.loads(data["result"])
+                tasks = parsed.get("tasks", []) if isinstance(parsed, dict) else []
+                if tasks:
+                    self._ensure_task_board(tasks)
+            except (json.JSONDecodeError, TypeError, AttributeError):
+                pass
 
     def _update_task(self, task_data: dict) -> None:
         """Update a task in the board from a TaskUpdate event."""
@@ -628,7 +866,16 @@ class TerminalUI:
             self.state.shutdown()
             self.running = False
 
+        async def on_open_palette(event: KeyEvent):
+            """Toggle the command palette (Ctrl+K)."""
+            self._palette_open = not self._palette_open
+            if self._palette_open:
+                self._palette_query = ""
+                self._palette_index = 0
+            self._dirty = True
+
         # Register handlers
+        self.input_handler.register_handler("open_palette", on_open_palette)
         self.input_handler.register_handler("submit_input", on_submit_input)
         self.input_handler.register_handler("delete_char", on_delete_char)
         self.input_handler.register_handler("history_prev", on_history_prev)
@@ -666,24 +913,8 @@ class TerminalUI:
 
                 # Populate task board from task management tool events.
                 tool_name = data.get("tool", "")
-                if tool_name == "TaskCreate" and data.get("args"):
-                    args = data["args"]
-                    self._update_task({
-                        "task_id": f"t{len(self._task_board) + 1}",
-                        "subject": args.get("subject", "Untitled"),
-                        "status": args.get("status", "pending"),
-                        "active_form": args.get("active_form", ""),
-                    })
-                elif tool_name == "TaskUpdate" and data.get("args"):
-                    self._update_task(data["args"])
-                elif tool_name == "TaskList" and data.get("result"):
-                    try:
-                        parsed = json.loads(data["result"])
-                        tasks = parsed.get("tasks", []) if isinstance(parsed, dict) else []
-                        if tasks:
-                            self._ensure_task_board(tasks)
-                    except (json.JSONDecodeError, TypeError, AttributeError):
-                        pass
+                if tool_name in ("TaskCreate", "TaskUpdate", "TaskList"):
+                    self._process_task_event(tool_name, data)
 
                 # ---- Sub-agent lane: update agent tree ────────────────
                 if depth >= 1 and entry.source in ("tool", "agent_status", "agent"):
@@ -698,7 +929,10 @@ class TerminalUI:
                     # Hidden tools (AskUserQuestion, TaskCreate, etc.) are
                     # never rendered — they are interaction/task-management
                     # tools whose results produce picker cards or task boards.
+                    # Their ERRORS, however, must not be swallowed.
                     if tool_name in self._hidden_tools:
+                        if data.get("error"):
+                            self.main_panel.add_error(f"{tool_name}: {data['error']}")
                         continue
                     # Each orchestrator tool renders as its own "o Read ..." line,
                     # NOT a collapsed card.
@@ -763,14 +997,18 @@ class TerminalUI:
 
         Mirrors render_processing_indicator output shape:
           - 1 line for header (* Blinking... or blank)
-          - 1 line for |_ tree connector
+          - 1 line for |_ tree connector (only when tasks exist)
           - 1 line per visible task
 
-        Returns 0 when no processing area is needed.
+        Returns 0 when not processing. While processing with no tasks the area is
+        still 1 line tall so the running indicator renders independently of the
+        task board.
         """
-        if not self._is_processing or not self._task_board:
+        if not self._is_processing:
             return 0
-        return 2 + len(self._task_board)
+        if self._task_board:
+            return 2 + len(self._task_board)
+        return 1
 
     def render_layout(self) -> Layout:
         """Create responsive layout: header -> main -> processing_area -> picker -> input -> status.
@@ -791,7 +1029,9 @@ class TerminalUI:
         # Picker overlay: dynamic height based on content when pending
         picker_height = 0
         if self._pending_approvals:
-            picker_height = 8
+            # Vertical picker: divider + header + tool/command/risk/desc (4) +
+            # blank + 5 options × 2 lines + keybar + divider ≈ 20-21 rows.
+            picker_height = min(21, max(9, height - 20))
         elif self._pending_question:
             qs = self._pending_question.get("questions", [])
             tab = self._pending_question.get("current_tab_index", 0)
@@ -804,6 +1044,8 @@ class TerminalUI:
                 n_opts = len(qs[tab].get("options", []))
                 estimated = 9 + n_opts * 2  # active question
             picker_height = min(estimated, max(8, height - 20))
+        elif self._palette_open:
+            picker_height = 12
 
         # Dynamic heights: processing_area + picker
         processing_height = self._calc_processing_height()
@@ -850,8 +1092,10 @@ class TerminalUI:
         # ── Render processing area (task board, blinking indicator) ───────
         if processing_height > 0:
             tasks = list(self._task_board.values()) if self._task_board else None
+            awaiting = bool(self._pending_approvals) and self._is_processing
             proc = OutputRenderer.render_processing_indicator(
-                self._is_processing, self._show_indicator, tasks=tasks
+                self._is_processing, self._show_indicator, tasks=tasks,
+                awaiting_approval=awaiting,
             )
             layout["processing_area"].update(proc)
 
@@ -860,11 +1104,14 @@ class TerminalUI:
             if self._pending_approvals and self._current_approval_idx < len(self._pending_approvals):
                 approval = self._pending_approvals[self._current_approval_idx]
                 approval_action = getattr(approval, "proposed_action", None) or {}
+                _, command_str = self._approval_action(approval)
                 picker_widget = OutputRenderer.render_permission_prompt(
                     tool=approval_action.get("tool_type", "unknown"),
-                    command_str=str(approval_action.get("args", {})),
+                    command_str=command_str or str(approval_action.get("args", {})),
                     risk=getattr(approval, "risk_level", "medium"),
                     description=getattr(approval, "summary", "") or "",
+                    focus_idx=self._approval_focus_idx,
+                    width=width,
                 )
                 layout["picker"].update(picker_widget)
             elif self._pending_question:
@@ -872,6 +1119,8 @@ class TerminalUI:
                     self._pending_question, width
                 )
                 layout["picker"].update(picker_widget)
+            elif self._palette_open:
+                layout["picker"].update(self._render_palette(width))
 
         # ── Render input area (pure input bar, always fixed at bottom) ────
         layout["input"].update(self.input_bar.render())
@@ -882,118 +1131,149 @@ class TerminalUI:
 
         return layout
 
-    async def _apply_approval_decision(self, approval_id: str, decision: str) -> None:
-        """Record approval decision in DB (Y handler)."""
+    @staticmethod
+    def _approval_action(approval) -> tuple[str, str]:
+        """Return (tool_name, resource) from a pending approval's proposed_action."""
+        action = getattr(approval, "proposed_action", None) or {}
+        if not isinstance(action, dict):
+            action = {}
+        tool_name = action.get("tool_type", "") or ""
+        args = action.get("args", {}) or {}
+        resource = args.get("command") or args.get("path") or ""
+        return str(tool_name), str(resource)
+
+    async def _finish_approval(self, approval, decision: str) -> None:
+        """Record the human's decision and release the executor's blocked call.
+
+        Applies the matching grant/deny policy (so the model's next call of the
+        same tool+resource is treated consistently) and resolves the approval
+        future the executor is awaiting. Every picker decision funnels through
+        here. SECURITY: Fails CLOSED — an unknown/errored decision becomes a deny.
+        """
         from harness.core.approval_manager import apply_decision
+        from harness.core.approval_policy import (
+            grant_once, grant_session, deny_once, deny_session,
+            persist_allow, coarse_fingerprint,
+        )
         import logging
+        if not approval:
+            return
         try:
+            approval_id = getattr(approval, "approval_id", None)
             if not approval_id:
+                logging.warning("Approval object missing approval_id")
                 return
-            await apply_decision(approval_id, decision, decided_by="user")
-            self._pending_approvals = [
-                a for a in self._pending_approvals
-                if getattr(a, "approval_id", None) != approval_id
-            ]
-            self._current_approval_idx = 0
+            tool_name, resource = self._approval_action(approval)
+
+            if decision in ("approved", "approved_session", "persist"):
+                await apply_decision(approval_id, "approved", decided_by="user")
+                if decision == "approved":
+                    grant_once(tool_name, resource)
+                elif decision == "approved_session":
+                    grant_session(tool_name, coarse_fingerprint(tool_name, resource))
+                else:  # persist
+                    persist_allow(tool_name)
+                    # Grant the session too so the current retry executes
+                    # immediately (the persisted rule is picked up on the next
+                    # scope build).
+                    grant_session(tool_name, coarse_fingerprint(tool_name, resource))
+            elif decision == "denied":
+                await apply_decision(approval_id, "rejected", decided_by="user", notes="")
+                deny_once(tool_name, resource)
+            elif decision == "denied_session":
+                await apply_decision(approval_id, "rejected", decided_by="user", notes="denied for session")
+                deny_session(tool_name, resource)
+            else:
+                logging.warning(f"Unknown approval decision '{decision}', failing closed")
+                await apply_decision(approval_id, "rejected", decided_by="system", notes="unknown decision")
+                deny_once(tool_name, resource)
+                decision = "denied"
+
+            self._resolve_approval(approval, decision)
         except Exception as e:
             logging.error(f"Failed to apply approval decision: {str(e)}", exc_info=True)
-            pass
+            # Never leave the executor blocked on an unresolved future.
+            self._resolve_approval(approval, "denied")
 
-    async def _prompt_rejection_reason(self, approval) -> None:
-        """Prompt for rejection reason (N handler)."""
-        from harness.core.approval_manager import apply_decision
-        import logging
-        if not approval:
+    def _resolve_approval(self, approval, decision: str) -> None:
+        """Resolve a pending approval's future and drop it from the picker list."""
+        approval_id = getattr(approval, "approval_id", None)
+        if not approval_id:
             return
-        try:
-            approval_id = getattr(approval, "approval_id", None)
-            if not approval_id:
-                logging.warning("Approval object missing approval_id")
-                return
-            await apply_decision(approval_id, "rejected", decided_by="user", notes="")
-            self._pending_approvals = [
-                a for a in self._pending_approvals
-                if getattr(a, "approval_id", None) != approval_id
-            ]
-            self._current_approval_idx = 0
-        except Exception as e:
-            logging.error(f"Failed to reject approval: {str(e)}", exc_info=True)
+        self._pending_approvals = [
+            a for a in self._pending_approvals
+            if getattr(a, "approval_id", None) != approval_id
+        ]
+        self._current_approval_idx = 0
+        self._approval_focus_idx = 0
+        future = self._approval_futures.get(approval_id)
+        if future is not None and not future.done():
+            future.set_result(decision)
         self._dirty = True
 
-    async def _apply_approval_with_session_grant(self, approval, decision: str) -> None:
-        """Approve and grant for this session (A handler)."""
-        from harness.core.approval_manager import apply_decision
-        from harness.core.approval_policy import grant_session, fingerprint_bash, fingerprint_file
-        from harness.tools.models import ToolType
-        import logging
+    async def _apply_approval_decision(self, approval, decision: str = "approved") -> None:
+        """Approve exactly this one call (Y handler).
 
-        if not approval:
-            return
-        try:
-            approval_id = getattr(approval, "approval_id", None)
-            if not approval_id:
-                logging.warning("Approval object missing approval_id")
-                return
+        The tool never ran when it parked as AWAITING_APPROVAL — the one-call
+        grant lets the model's retry of THIS call execute, while a different
+        call with the same tool still re-asks.
+        """
+        await self._finish_approval(approval, "approved")
 
-            await apply_decision(approval_id, decision, decided_by="user")
-            action = getattr(approval, "proposed_action", None) or {}
-            tool_name = action.get("tool_type", "")
-            args = action.get("args", {})
+    async def _prompt_rejection_reason(self, approval) -> None:
+        """Deny exactly this one call (N handler)."""
+        await self._finish_approval(approval, "denied")
 
-            if "Bash" in tool_name:
-                fp = fingerprint_bash(args.get("command", ""))
-            elif any(x in tool_name for x in ["Read", "Write", "Edit"]):
-                fp = fingerprint_file(args.get("path", ""))
-            else:
-                fp = ""
+    async def _apply_approval_with_session_grant(self, approval, decision: str = "approved") -> None:
+        """Approve for this session (A handler) — same tool+fingerprint won't re-ask."""
+        await self._finish_approval(approval, "approved_session")
 
-            if fp:
-                grant_session(tool_name, fp)
+    async def _apply_approval_with_session_deny(self, approval) -> None:
+        """Deny for this session (S handler) — suppress further prompts."""
+        await self._finish_approval(approval, "denied_session")
 
-            self._pending_approvals = [
-                a for a in self._pending_approvals
-                if getattr(a, "approval_id", None) != approval_id
-            ]
-            self._current_approval_idx = 0
-        except Exception as e:
-            logging.error(f"Failed to apply session grant: {str(e)}", exc_info=True)
+    async def _apply_approval_with_persisted_grant(self, approval, decision: str = "approved") -> None:
+        """Approve and persist to the project .code/settings.json (P handler) so
+        future sessions in this project stop prompting for this tool."""
+        await self._finish_approval(approval, "persist")
 
-    async def _apply_approval_with_persisted_grant(self, approval, decision: str) -> None:
-        """Approve and save persisted rule (P handler)."""
-        from harness.core.approval_manager import apply_decision
-        from harness.core.approval_policy import grant_persisted, fingerprint_bash, fingerprint_file
-        import logging
+    # ── Approval picker key dispatch ────────────────────────────────────────
 
-        if not approval:
-            return
-        try:
-            approval_id = getattr(approval, "approval_id", None)
-            if not approval_id:
-                logging.warning("Approval object missing approval_id")
-                return
+    def _approval_picker_decision(self, key: str, n_opts: int) -> Optional[str]:
+        """Map one approval-picker key to a decision string.
 
-            await apply_decision(approval_id, decision, decided_by="user")
-            action = getattr(approval, "proposed_action", None) or {}
-            tool_name = action.get("tool_type", "")
-            args = action.get("args", {})
+        Returns the decision to resolve the pending approval with, or None when
+        the key only moved the ▸ focus (or was ignored). Extracted from the input
+        loop so the mapping is unit-testable and the loop stays a thin read loop.
 
-            if "Bash" in tool_name:
-                fp = fingerprint_bash(args.get("command", ""))
-            elif any(x in tool_name for x in ["Read", "Write", "Edit"]):
-                fp = fingerprint_file(args.get("path", ""))
-            else:
-                fp = ""
-
-            if fp:
-                await grant_persisted(tool_name, fp, decision="allow")
-
-            self._pending_approvals = [
-                a for a in self._pending_approvals
-                if getattr(a, "approval_id", None) != approval_id
-            ]
-            self._current_approval_idx = 0
-        except Exception as e:
-            logging.error(f"Failed to apply persisted grant: {str(e)}", exc_info=True)
+        Key handling:
+          ↑/↓ or j/k   → move focus (None, no decision)
+          1-5          → select option by position
+          Y/A/P/N/S    → select by shortcut letter
+          Enter        → select the currently focused option (never a hidden
+                         default; the renderer's keybar shows it live)
+          anything else → ignored (None)
+        """
+        if key in (KeyCode.UP.value, "k"):
+            self._approval_focus_idx = (self._approval_focus_idx - 1) % n_opts
+            return None
+        if key in (KeyCode.DOWN.value, "j"):
+            self._approval_focus_idx = (self._approval_focus_idx + 1) % n_opts
+            return None
+        if key in "12345":
+            idx = int(key) - 1
+            if 0 <= idx < n_opts:
+                self._approval_focus_idx = idx
+                return APPROVAL_OPTIONS[idx]["decision"]
+            return None
+        shortcut = _APPROVAL_SHORTCUTS.get(key.lower())
+        if shortcut is not None:
+            return shortcut["decision"]
+        if key in (KeyCode.ENTER.value, "\r", "\n"):
+            return APPROVAL_OPTIONS[
+                self._approval_focus_idx % len(APPROVAL_OPTIONS)
+            ]["decision"]
+        return None
 
     async def input_loop(self) -> None:
         """Main keyboard input loop."""
@@ -1004,30 +1284,16 @@ class TerminalUI:
                     await asyncio.sleep(0.01)
                     continue
 
-                # Intercept keys for pending approvals
+                # Intercept keys for the vertical approval picker (all keys consumed
+                # while an approval is pending; the loop never falls through).
                 if self._pending_approvals and self._current_approval_idx < len(self._pending_approvals):
                     current_approval = self._pending_approvals[self._current_approval_idx]
-                    if key.lower() == "y":
-                        await self._apply_approval_decision(current_approval.approval_id, "approved")
-                        self._dirty = True
-                        await asyncio.sleep(0.001)
-                        continue
-                    elif key.lower() == "n":
-                        await self._prompt_rejection_reason(current_approval)
-                        self._dirty = True
-                        await asyncio.sleep(0.001)
-                        continue
-                    elif key.lower() == "a":
-                        await self._apply_approval_with_session_grant(current_approval, "approved")
-                        self._dirty = True
-                        await asyncio.sleep(0.001)
-                        continue
-                    elif key.lower() == "p":
-                        await self._apply_approval_with_persisted_grant(current_approval, "approved")
-                        self._dirty = True
-                        await asyncio.sleep(0.001)
-                        continue
-                    # Other keys ignored during approval
+                    decision = self._approval_picker_decision(
+                        key, len(APPROVAL_OPTIONS)
+                    )
+                    if decision is not None:
+                        await self._finish_approval(current_approval, decision)
+                    self._dirty = True
                     await asyncio.sleep(0.001)
                     continue
 
@@ -1039,6 +1305,12 @@ class TerminalUI:
                         continue
                     # When a question is pending, ALL keys go to the picker.
                     # Never fall through to the input bar.
+                    await asyncio.sleep(0.001)
+                    continue
+
+                # Route keys to the command palette when it is open.
+                if self._palette_open:
+                    await self._handle_palette_key(key)
                     await asyncio.sleep(0.001)
                     continue
 
@@ -1077,13 +1349,14 @@ class TerminalUI:
                         self._refresh_agent_tree()
                     self._dirty = True
 
-                # Processing indicator + task board blink: toggle every 4 frames
+                # Processing indicator + task board blink: toggle every 4 frames.
+                # Always mark dirty while processing so the header blinks even
+                # with an empty task board (running state ≠ task-board presence).
                 if self._is_processing:
                     new_show = (self._spinner_frame // 4) % 2 == 0
                     if new_show != self._show_indicator:
                         self._show_indicator = new_show
-                        if self._task_board:
-                            self._dirty = True
+                        self._dirty = True
 
                 # Task board: collapse 2s after all tasks complete
                 self._age_completed_tasks()
@@ -1577,11 +1850,24 @@ class TerminalUI:
                 self._text_dirty = True
             self._dirty = True
 
+        def end_turn() -> None:
+            """Close the open assistant block so the next turn starts its own.
+
+            A verifier-rejected turn loops without any tool call in between, and
+            only tool calls otherwise reset the block — so without this the next
+            turn's text concatenates into the previous bullet.
+            """
+            self._flush_active_text()
+            self._active_text_idx = None
+            self._active_text_raw = ""
+
         try:
             # Preferred path: main agent with tools + delegation.
             if self.orchestrator:
                 try:
-                    result = await self.orchestrator.chat(prompt, on_text_delta=append_chunk)
+                    result = await self.orchestrator.chat(
+                        prompt, on_text_delta=append_chunk, on_turn_end=end_turn
+                    )
                     if result and result.output and not self._active_text_raw.strip():
                         append_chunk(result.output)
                     if result and not result.success and result.error:
