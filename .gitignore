@@ -156,6 +156,8 @@ activemq-data/
 # Environments
 .env
 .envrc
+# Project-level .code config (may carry env tokens + local permission grants)
+.code/
 .venv
 env/
 venv/

@@ -16,13 +16,28 @@ from typing import Literal
 from harness.config import get_app_settings
 
 
+class ApprovalRequired(Exception):
+    """Raised when a tool+resource needs human approval but has not been granted.
+
+    The tool executor converts this into an AWAITING_APPROVAL result so the call
+    is never executed silently.
+    """
+
+
 @dataclass
 class ToolPermission:
-    """Single tool's permission state."""
+    """Single tool's permission state.
+
+    ``patterns`` scopes the tool's mode: for ``ask`` they narrow which resources
+    prompt, for ``deny`` which resources are blocked. ``deny_patterns`` carries
+    path-scoped deny rules on an otherwise-allowed tool (e.g. Read allowed
+    everywhere except ``.env*`` / ``.git/*``).
+    """
 
     tool: str
     mode: Literal["allow", "deny", "ask"]
-    patterns: list[str] = field(default_factory=list)  # e.g., ["Read(.env*)", "Write(.git/*)"]
+    patterns: list[str] = field(default_factory=list)       # scopes the mode
+    deny_patterns: list[str] = field(default_factory=list)  # path-scoped deny on an allow/ask tool
 
 
 @dataclass
@@ -53,37 +68,51 @@ class PermissionScope:
         app_settings = get_app_settings()
         perm_config = app_settings.get("permissions", {})
 
-        tools = {}
-
-        # Allow tools - no patterns, always allowed
-        for tool in perm_config.get("allow", []):
-            tools[tool] = ToolPermission(tool=tool, mode="allow")
-
-        # Ask tools - no patterns, always require approval
-        for tool in perm_config.get("ask", []):
-            tools[tool] = ToolPermission(tool=tool, mode="ask")
-
-        # Deny tools - WITH patterns to block specific paths
-        # Support both new format (deny as tool names, patterns separate)
-        # and legacy format (deny as "Tool(pattern)" strings)
-        # Deny OVERRIDES any prior mode (allow/ask) for the same tool
+        allow_list = perm_config.get("allow", [])
+        deny_list = perm_config.get("deny", [])
+        ask_list = perm_config.get("ask", [])
         patterns_config = perm_config.get("patterns", {})
-        for tool_entry in perm_config.get("deny", []):
-            tool_name = tool_entry
-            patterns = []
 
-            # Legacy format: "Tool(pattern)" → extract both
-            if "(" in tool_entry and ")" in tool_entry:
-                tool_name, pattern_part = tool_entry.split("(", 1)
-                pattern_part = pattern_part.rstrip(")")
-                patterns = [pattern_part] if pattern_part else []
+        # Build per-tool permissions with path scoping. Priority: deny > ask >
+        # allow — a tool in several lists keeps each concern, instead of the last
+        # list silently overwriting the others (which is what blanketed Read in
+        # deny and dropped its patterns).
+        tools: dict[str, ToolPermission] = {}
 
-            # New format: get patterns from patterns dict
-            patterns_from_config = patterns_config.get(tool_name, [])
-            if patterns_from_config:
-                patterns = patterns_from_config
+        # Deny is strongest: whole-tool, or path-scoped via `patterns`.
+        for tool in deny_list:
+            tools[tool] = ToolPermission(
+                tool=tool, mode="deny", patterns=list(patterns_config.get(tool, []))
+            )
 
-            tools[tool_name] = ToolPermission(tool=tool_name, mode="deny", patterns=patterns)
+        # Ask: prompt on matching paths, or always when the entry has no patterns.
+        # A tool already deny-scoped (e.g. Write on .git/*) keeps those hard deny
+        # paths while prompting for everything else.
+        for tool in ask_list:
+            existing = tools.get(tool)
+            if existing is not None and existing.mode == "deny":
+                tools[tool] = ToolPermission(
+                    tool=tool,
+                    mode="ask",
+                    patterns=[],
+                    deny_patterns=list(existing.patterns),
+                )
+            else:
+                tools[tool] = ToolPermission(
+                    tool=tool, mode="ask", patterns=list(patterns_config.get(tool, []))
+                )
+
+        # Allow is weakest. An allowlisted tool that is also deny-scoped (e.g.
+        # Read on .env*/.git/*) keeps those deny paths (hard block) but is allowed
+        # everywhere else.
+        for tool in allow_list:
+            existing = tools.get(tool)
+            if existing is not None and existing.mode == "deny":
+                tools[tool] = ToolPermission(
+                    tool=tool, mode="allow", deny_patterns=list(existing.patterns)
+                )
+            else:
+                tools.setdefault(tool, ToolPermission(tool=tool, mode="allow"))
 
         # If no explicit config, default to allow common tools
         if not tools:
@@ -103,71 +132,92 @@ class PermissionScope:
     def check(self, tool: str, resource: str = "") -> tuple[bool, str | None]:
         """Check if tool+resource is allowed.
 
+        Rules are evaluated in priority order:
+        1. deny — hard block, path-scoped by the tool's patterns (a deny entry
+           with no patterns blocks the tool everywhere).
+        2. alwaysAsk — always requires approval.
+        3. ask — requires approval on matching paths (or always when the entry
+           carries no patterns).
+        4. allow — allowed without approval.
+        5. default — third-party MCP tools ask; strict scope denies; else allowed.
+
         Returns (allowed, mode) where mode is:
         - None: allowed without approval
         - "requires_approval": allowed but needs user approval
-        - None (with False): denied (caller should raise PermissionError)
+        - caller treats (False, None) as denied
         """
         perm = self.tools.get(tool)
 
-        # Deny mode: blocks when pattern matches; allows when pattern doesn't match
+        # 1. Deny first. Path-scoped deny blocks only matching resources.
         if perm and perm.mode == "deny":
-            if self._matches_patterns(resource, perm.patterns):
-                return False, None  # Pattern matched → BLOCK access
-            # Pattern didn't match → tool is allowed
-            return True, None
+            if not perm.patterns or self._matches_patterns(resource, perm.patterns):
+                return False, None
+        elif perm and perm.deny_patterns and self._matches_patterns(resource, perm.deny_patterns):
+            return False, None
 
-        # Always-ask tools require approval
+        # 2. Always-ask tools require approval
         if tool in self.always_ask:
             return True, "requires_approval"
 
-        if not perm:
-            if self.default_mode == "strict":
-                return False, None
+        # 3. Ask — prompt on matching paths (or always when unpatterned)
+        if perm and perm.mode == "ask":
+            if not perm.patterns or self._matches_patterns(resource, perm.patterns):
+                return True, "requires_approval"
             return True, None
 
-        # Ask mode: require approval for all operations
-        if perm.mode == "ask":
-            return True, "requires_approval"
+        # 4. Allow
+        if perm and perm.mode == "allow":
+            return True, None
 
-        # Allow mode: always permitted
+        # 5. Default for tools with no explicit rule
+        if not perm:
+            # Third-party MCP tools default to ask (approval) unless the operator
+            # explicitly allowlists them (or the scope is permissive).
+            if tool.startswith("mcp__") and self.default_mode != "permissive":
+                return True, "requires_approval"
+            if self.default_mode == "strict":
+                return False, None
+
         return True, None
 
     @staticmethod
     def _matches_patterns(resource: str, patterns: list[str]) -> bool:
         """Check if resource matches any pattern.
 
-        Patterns can be:
-        - Simple glob: ".env*" (matches filename)
-        - Path glob: ".git/*" (matches path components)
-        - Legacy format: "Tool(.env*)" → extracted as ".env*"
-        """
-        if not resource:
-            return False
+        Accepts both "Tool(glob)" entries (e.g. "Read(.env*)") and the bare globs
+        used in settings.json's ``patterns`` block (e.g. ".env*", ".git/*").
 
-        resource_path = Path(resource)
-        filename = resource_path.name
+        Uses fnmatch semantics so ``*`` never crosses a path separator, preventing
+        patterns like ``.env*`` from matching ``/deep/nested/.env``.
+        """
+        import fnmatch
+        from pathlib import PurePosixPath
 
         for pattern in patterns:
             glob_part = pattern
-
-            # Handle legacy format: "Tool(glob_pattern)"
             if "(" in pattern and ")" in pattern:
-                _, glob_part = pattern.split("(", 1)
-                glob_part = glob_part.rstrip(")")
+                # "Read(.env*)" → ".env*"
+                glob_part = pattern.split("(", 1)[1].rstrip(")")
 
-            # Use fnmatch for filename matching (handles ".env*")
-            # Use Path.match() for glob patterns with path separators (handles ".git/*")
-            if fnmatch.fnmatch(filename, glob_part):
-                return True
+            # Normalise separators so Windows paths work with posix-style globs.
+            norm_resource = resource.replace("\\", "/")
+            norm_glob = glob_part.replace("\\", "/")
 
-            # For patterns with path separators, use pathlib's glob matching
-            if "/" in glob_part or "\\" in glob_part:
+            if "/" in norm_glob:
+                # Path-qualified glob (e.g. ".git/*", "src/**/*.py") — use
+                # PurePosixPath.match() which handles "**" and keeps "*" within a
+                # single segment.
                 try:
-                    if resource_path.match(glob_part):
+                    if PurePosixPath(norm_resource).match(norm_glob):
                         return True
-                except (ValueError, TypeError):
+                except Exception:
                     pass
+            else:
+                # Bare filename glob (e.g. ".env*", "*.key") — match against the
+                # last path component only so it cannot cross directory boundaries.
+                basename = norm_resource.rsplit("/", 1)[-1] if "/" in norm_resource else norm_resource
+                if fnmatch.fnmatch(basename, norm_glob):
+                    return True
 
         return False
 

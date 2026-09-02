@@ -257,6 +257,31 @@ class PendingQuestion(Base):
     answered_at = Column(DateTime, nullable=True)
 
 
+class UserTask(Base):
+    """A to-do item created by the LLM via TaskCreate.
+
+    Distinct from `Task`, which records agent-loop execution state. This table is
+    the user-facing checklist and is keyed by session so a task created on one
+    prompt is still pending on the next.
+    """
+    __tablename__ = "user_tasks"
+
+    id = Column(String(36), primary_key=True, index=True)
+    session_id = Column(String(36), nullable=False, index=True)
+    subject = Column(Text, nullable=False)
+    description = Column(Text, default="")
+    active_form = Column(Text, default="")
+    status = Column(String(50), default="pending", index=True)  # pending, in_progress, completed
+    metadata_json = Column(JSON, default={})
+
+    created_at = Column(DateTime, default=datetime.now, index=True)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+    __table_args__ = (
+        Index('ix_usertask_session_status', 'session_id', 'status'),
+    )
+
+
 class Analytics(Base):
     """System analytics and learning metrics."""
     __tablename__ = "analytics"

@@ -12,10 +12,12 @@ from harness.core.completion import CompletionChecker
 from harness.context.project_context import load_project_context
 from harness.registry.definitions import AgentRegistry, SkillRegistry, ensure_seed_agents
 from harness.tools.permissions import PermissionScope
+from harness.tools.mcp_manager import MCPManager
 from harness.ui import TerminalUI, StreamListener, LogEntry, LogLevel
 from harness.config import get_settings
 from harness.memory import build_briefing
 from harness.persistence.session import SessionManager
+from harness.plugins.loader import collect_plugin_commands, load_installed_plugins
 from .agent import AgentConfig, AgentType
 from .spawner import AgentSpawner
 from .llm_client import LLMClient
@@ -45,6 +47,10 @@ class HarnessOrchestrator:
         self.agent_registry.scan()
         self.skill_registry.scan()
 
+        # MCP manager — owns all configured + dynamically-added servers.
+        # Loaded from settings.json in ensure_session(); supports hot-plug via register_mcp_server().
+        self.mcp_manager = MCPManager()
+
         # Build shared LLMClient from settings
         llm_client = LLMClient()
 
@@ -59,6 +65,7 @@ class HarnessOrchestrator:
             stream_listener=self.stream_listener,
             approval_callback=self.ui.request_approval if self.ui else None,
             ask_user_question_callback=self.ui.ask_user_question_callback if self.ui else None,
+            mcp_manager=self.mcp_manager,
         )
 
         # Session management and briefing
@@ -75,6 +82,27 @@ class HarnessOrchestrator:
         settings = get_settings()
         user_id = settings.user_id
 
+        # Mount installed plugins into the agent/skill registries (namespaced
+        # by marketplace alias) so their agents/skills reach the LLM roster as
+        # `<marketplace>-<name>`. No MCP reconciliation needed here — servers
+        # are merged into settings.json at install time.
+        load_installed_plugins(self.agent_registry, self.skill_registry)
+
+        # Mount installed plugin slash-commands into the UI palette so they show
+        # up under Ctrl+K and run on demand (bodies read lazily at invoke time).
+        if self.ui is not None:
+            self.ui.mount_plugin_commands(collect_plugin_commands())
+
+        # Load MCP servers from settings.json and connect them (non-blocking: degraded
+        # servers are skipped so a slow or offline server never delays startup).
+        if not self.mcp_manager.started:
+            await self.mcp_manager.load_from_settings()
+            await self.mcp_manager.start()
+            logger.info(
+                "MCP servers loaded",
+                healthy=[p.name for p in self.mcp_manager.healthy()],
+            )
+
         # Create session in database
         self.session_id = await self._session_manager.create_session(
             user_id=user_id,
@@ -87,6 +115,46 @@ class HarnessOrchestrator:
 
         logger.info(f"Session created: {self.session_id}", briefing_chars=len(self.briefing_text or ""))
         return self.session_id
+
+    async def register_mcp_server(self, name: str, config: dict) -> None:
+        """Hot-plug a new MCP server at runtime (e.g. from marketplace install).
+
+        The server starts immediately; subsequent spawns automatically include its
+        tools in their router (mcp_manager is shared via AgentSpawner reference).
+        No restart required.
+
+        config format (same as settings.json mcpServers block):
+          stdio:  {"command": "npx", "args": ["@org/mcp-server"], "env": {}}
+          http:   {"url": "https://server/mcp", "headers": {"Authorization": "Bearer ..."}}
+        """
+        await self.mcp_manager.add(name, config)
+        logger.info("MCP server registered (hot-plugged)", name=name, tools=len(
+            [t for t in self.mcp_manager.all_tools() if t.name.startswith(f"mcp__{name}__")]
+        ))
+
+    async def deregister_mcp_server(self, name: str) -> None:
+        """Remove an MCP server at runtime (e.g. marketplace uninstall).
+
+        The server's tools are removed from the next spawn's router immediately.
+        In-flight agent runs finish with the previous router snapshot (isolated per-spawn).
+        """
+        await self.mcp_manager.remove(name)
+        logger.info("MCP server deregistered", name=name)
+
+    def reload_registries(self) -> None:
+        """Rescan agent and skill directories after a marketplace install/uninstall.
+
+        Drop new agent/skill markdown files into ~/.code/agents/ or ~/.code/skills/
+        (or the project-level .code/ equivalents), then call this — subsequent spawns
+        immediately see the new roster. No restart required.
+        """
+        self.agent_registry.scan()
+        self.skill_registry.scan()
+        logger.info(
+            "Registries reloaded",
+            agents=len(self.agent_registry.list_agents()),
+            skills=len(self.skill_registry.list_skills()),
+        )
 
     def compose_capsule(self, agent_result) -> dict:
         """Compose token-efficient capsule from agent result.
@@ -156,14 +224,16 @@ class HarnessOrchestrator:
             prior_turns=list(self.turns),
         )
 
-    async def chat(self, prompt: str, on_text_delta=None):
+    async def chat(self, prompt: str, on_text_delta=None, on_turn_end=None):
         """Handle an interactive chat prompt through the main orchestrator agent.
 
         Routes chat through the same tool-calling agent path as tasks so the model
         can actually read/write/run commands and delegate to sub-agents.
         """
         config = self._build_main_agent_config(prompt)
-        result = await self.agent_spawner.spawn(config, on_text_delta=on_text_delta)
+        result = await self.agent_spawner.spawn(
+            config, on_text_delta=on_text_delta, on_turn_end=on_turn_end
+        )
         self._record_turn(prompt, result)
         return result
 

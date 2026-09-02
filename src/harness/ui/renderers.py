@@ -7,6 +7,64 @@ from .claude_code_style import Styles, Colors
 from .markdown_text import render_markdown
 
 
+def option_text(opt: dict, num: Any = "") -> str:
+    """Resolve an option's display text across the accepted key spellings.
+
+    The tool schema documents `label`, older payloads use `title`, and models
+    sometimes emit `text`/`option`. Rendering and answer capture MUST share this
+    resolver — when they diverged, the picker displayed the choice while capture
+    returned "" and the model was told no input was given.
+    """
+    return (
+        opt.get("title") or opt.get("label") or opt.get("text")
+        or opt.get("option") or (f"Option {num}" if num != "" else "")
+    )
+
+
+# Approval picker options — single source of truth for rendering AND key dispatch.
+# `key` is the single-key shortcut, `decision` is what terminal.py maps through
+# _finish_approval() to the grant/deny policy. Order = display order; the first
+# option is the initial ▸ focus, and the keybar shows its action live so the
+# human always sees what Enter will do before pressing it.
+APPROVAL_OPTIONS = [
+    {
+        "key": "y",
+        "num": 1,
+        "label": "Allow once",
+        "detail": "Run this tool call one time",
+        "decision": "approved",
+    },
+    {
+        "key": "a",
+        "num": 2,
+        "label": "Allow for session",
+        "detail": "Run it and don't ask again for this tool during this session",
+        "decision": "approved_session",
+    },
+    {
+        "key": "p",
+        "num": 3,
+        "label": "Always allow",
+        "detail": "Remember the choice and save to project settings",
+        "decision": "persist",
+    },
+    {
+        "key": "n",
+        "num": 4,
+        "label": "Deny once",
+        "detail": "Block this tool call",
+        "decision": "denied",
+    },
+    {
+        "key": "s",
+        "num": 5,
+        "label": "Deny for session",
+        "detail": "Suppress further prompts for this tool during this session",
+        "decision": "denied_session",
+    },
+]
+
+
 def _format_args_compact(args: Optional[dict] = None, max_val: int = 40) -> str:
     """Format tool arguments as a compact display string."""
     if not args:
@@ -316,17 +374,13 @@ class OutputRenderer:
         is_processing: bool,
         show_indicator: bool,
         tasks: Optional[list] = None,
+        awaiting_approval: bool = False,
     ) -> Text:
-        """Render ✳ Running… + optional |_ task list in the processing area.
+        """Render * Blinking... + |_ + task list in processing area.
 
-        While is_processing:
-          - ✳ glyph always renders; only the "Running…" label toggles between
-            bright and dim with show_indicator. Keeping the glyph outside the
-            toggle holds the row at a fixed height, so the input bar below it
-            never shifts as the label blinks.
-          - When tasks exist: |_ tree connector + task checkboxes underneath
-            (□ pending, ■ running, ■ strikethrough done).
-          - When no tasks exist: the single ✳ Running… line renders alone.
+        The header renders whenever the system is processing — even with zero
+        tasks — so the running indicator reflects actual activity, not task-board
+        creation. The |_ tree and task checkboxes only render when tasks exist.
         When not processing: returns empty Text.
         """
         result = Text()
@@ -341,29 +395,29 @@ class OutputRenderer:
         )
         result.append("\n")
 
-        if not tasks:
-            return result
+        # Awaiting-approval banner — shown whenever the agent is parked on a picker.
+        if awaiting_approval:
+            result.append("  Awaiting approval...\n", style=Styles.OPTION_DETAIL)
 
-        # Tree connector
-        result.append("|_\n", style=Styles.OPTION_DETAIL)
-
-        # Task list
-        for task in tasks:
-            status = task.get("status", "pending")
-            subject = task.get("subject", task.get("name", "Untitled"))
-            if len(subject) > 55:
-                subject = subject[:55] + "…"
-            result.append("  ", style=Styles.OPTION_DETAIL)
-            if status == "completed":
-                result.append("■ ", style=Styles.TASK_BOX_DONE)
-                result.append(subject, style=Styles.TASK_TEXT_DONE)
-            elif status == "in_progress":
-                result.append("■ ", style=Styles.TASK_BOX_RUNNING)
-                result.append(subject, style=Styles.USER_TEXT)
-            else:
-                result.append("□ ", style=Styles.TASK_BOX_PENDING)
-                result.append(subject, style=Styles.TASK_META)
-            result.append("\n")
+        # Tree connector + task list only when tasks exist
+        if tasks:
+            result.append("|_\n", style=Styles.OPTION_DETAIL)
+            for task in tasks:
+                status = task.get("status", "pending")
+                subject = task.get("subject", task.get("name", "Untitled"))
+                if len(subject) > 55:
+                    subject = subject[:55] + "…"
+                result.append("  ", style=Styles.OPTION_DETAIL)
+                if status == "completed":
+                    result.append("■ ", style=Styles.TASK_BOX_DONE)
+                    result.append(subject, style=Styles.TASK_TEXT_DONE)
+                elif status == "in_progress":
+                    result.append("■ ", style=Styles.TASK_BOX_RUNNING)
+                    result.append(subject, style=Styles.USER_TEXT)
+                else:
+                    result.append("□ ", style=Styles.TASK_BOX_PENDING)
+                    result.append(subject, style=Styles.TASK_META)
+                result.append("\n")
 
         return result
 
@@ -546,7 +600,7 @@ class OutputRenderer:
                     result.append("  ", style=Styles.CURSOR_BLINK)
 
                 num = opt.get("num", oi + 1)
-                title = opt.get("title") or opt.get("label") or opt.get("text") or opt.get("option") or f"Option {num}"
+                title = option_text(opt, num)
                 cstyle = Styles.OPTION_FOCUS if (is_focused or is_selected) else Styles.OPTION_NORMAL
 
                 result.append(f"{num}. ", style=Styles.TASK_BOX_PENDING)
@@ -809,16 +863,55 @@ class OutputRenderer:
 
     @staticmethod
     def render_permission_prompt(tool: str, command_str: str, risk: str,
-                                   description: str = "") -> Text:
-        """Render permission prompt as inline text."""
+                                   description: str = "", focus_idx: int = 0,
+                                   width: int = 80) -> Text:
+        """Render the permission prompt as a vertical, selectable option list.
+
+        Shares the AskUserQuestion picker's visual language (thick dividers,
+        a ▸ focus marker, aligned brackets) so approval feels like part of the
+        same UI. The focused option is highlighted and repeated in the keybar
+        ("▶ Allow once") so the human always sees what Enter will do — no hidden
+        default, no accidental approve.
+        """
+        divider = "═" * min(width, 80)
         result = Text()
-        result.append(f"  Tool: {tool}\n", style=Styles.USER_TEXT)
-        result.append(f"  Command: {command_str[:80]}\n", style=Styles.AI)
+        result.append(divider + "\n", style=Styles.DIVIDER)
+        result.append("  🔐 Permission required\n\n", style=Styles.SUBMIT_HEADING)
+
+        # ── Tool / command / risk / summary ─────────────────────────────
+        result.append("  Tool      ", style=Styles.USER_TEXT)
+        result.append(f"{tool}\n", style=Styles.AI)
+        if command_str:
+            result.append("  Command   ", style=Styles.USER_TEXT)
+            result.append(f"{command_str[:80]}\n", style=Styles.AI)
+        risk_color = Styles.WORKING if risk in ("high", "critical") else Styles.TOOL_COUNT
+        result.append("  Risk      ", style=Styles.USER_TEXT)
+        result.append(f"{risk}\n", style=risk_color)
         if description:
             result.append(f"  {description}\n", style=Styles.AI)
-        risk_color = Styles.WORKING if risk in ("high", "critical") else Styles.TOOL_COUNT
-        result.append(f"  Risk: {risk}\n", style=risk_color)
-        result.append("\n  [Y] Yes   [N] No   [A] Always   [S] Skip", style=Styles.USER_TEXT)
+        result.append("\n")
+
+        # ── Vertical options with ▸ focus marker ────────────────────────
+        n_opts = len(APPROVAL_OPTIONS)
+        for oi, opt in enumerate(APPROVAL_OPTIONS):
+            is_focused = oi == (focus_idx % n_opts)
+            label_style = Styles.OPTION_FOCUS if is_focused else Styles.OPTION_NORMAL
+            bracket_style = Styles.PICKER_FOCUS if is_focused else Styles.PICKER_NORMAL
+            detail_style = Styles.OPTION_DETAIL if is_focused else Styles.INPUT_PLACEHOLDER
+
+            result.append("▸ " if is_focused else "  ", style=Styles.CURSOR_BLINK)
+            result.append(f"{opt['num']}. ", style=Styles.TASK_BOX_PENDING)
+            result.append(f"{opt['label']}{' ' * (22 - len(opt['label']))}",
+                          style=label_style)
+            result.append(f"[{opt['key'].upper()}]\n", style=bracket_style)
+            result.append(f"      {opt['detail']}\n", style=detail_style)
+
+        # ── Keybar: navigation hint + live Enter action ─────────────────
+        focused = APPROVAL_OPTIONS[focus_idx % n_opts]
+        result.append("  ↑↓ navigate   Enter select   ", style=Styles.KEYBAR_BG)
+        result.append(f"▶ {focused['label']}  ", style=Styles.PICKER_FOCUS)
+        result.append("1-5 / letter quick-pick\n", style=Styles.KEYBAR_BG)
+        result.append(divider + "\n", style=Styles.DIVIDER)
         return result
 
     @staticmethod
