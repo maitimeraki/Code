@@ -4,6 +4,8 @@
 
 Built like Claude Code: an interactive Rich terminal UI plus a full CLI, all in one installable Python package (Python ≥ 3.11).
 
+[![Watch the video]](./Code-demo.mp4)
+
 ---
 
 ## What is this?
