@@ -54,7 +54,6 @@ class ToolRouter:
             handler = self.handlers[tool_type]
             logger.info(f"Calling {tool_name}", args=kwargs)
             result = await handler(**kwargs)
-
             tool_call.status = ToolStatus.SUCCESS
             tool_call.result = result
             tool_call.tokens_used = len(str(result).split())

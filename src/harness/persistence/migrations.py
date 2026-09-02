@@ -133,11 +133,73 @@ async def migrate_v1_to_v2(session) -> None:
         raise
 
 
+async def migrate_v2_to_v3(session) -> None:
+    """Migrate schema from v2 to v3: Add project_id columns for multi-project scoping.
+
+    Adds project_id (nullable String(16)) to all tables for project isolation.
+    Creates compound indices for efficient project-scoped queries.
+    """
+    try:
+        tables_to_migrate = [
+            ('sessions', True),
+            ('tasks', True),
+            ('agent_executions', True),
+            ('tool_calls', True),
+            ('knowledge_entries', True),
+            ('task_journals', True),
+            ('approval_requests', True),
+            ('executed_actions', True),
+            ('error_memory', True),
+            ('user_preferences', True),
+            ('pending_questions', True),
+            ('analytics', True),
+        ]
+
+        for table_name, nullable in tables_to_migrate:
+            result = await session.execute(
+                text(f"PRAGMA table_info({table_name})")
+            )
+            columns = {row[1] for row in result.fetchall()}
+
+            if "project_id" not in columns:
+                nullable_clause = "NULL" if nullable else "NOT NULL DEFAULT 'default'"
+                await session.execute(
+                    text(f"ALTER TABLE {table_name} ADD COLUMN project_id VARCHAR(16) {nullable_clause}")
+                )
+                logger.info(f"Added project_id column to {table_name}")
+
+        indices = [
+            ("idx_session_project", "sessions", "(project_id, session_id)"),
+            ("idx_task_project_status", "tasks", "(project_id, status)"),
+            ("idx_task_project_session", "tasks", "(project_id, session_id)"),
+            ("idx_agentexec_project_task", "agent_executions", "(project_id, task_id)"),
+            ("idx_toolcall_project_task", "tool_calls", "(project_id, task_id)"),
+            ("idx_knowledge_project", "knowledge_entries", "(project_id, task_type)"),
+            ("idx_journal_project_task", "task_journals", "(project_id, task_id)"),
+            ("idx_errormem_project", "error_memory", "(project_id, signature)"),
+        ]
+
+        for idx_name, table, columns in indices:
+            await session.execute(
+                text(f"CREATE INDEX IF NOT EXISTS {idx_name} ON {table}{columns}")
+            )
+            logger.info(f"Created index {idx_name}")
+
+        await session.commit()
+        logger.info("Database migration v2->v3 complete")
+
+    except Exception as e:
+        await session.rollback()
+        logger.error("Migration v2→v3 failed", error=str(e))
+        raise
+
+
 async def apply_migrations(session) -> None:
     """Apply all pending migrations in order."""
     try:
         await migrate_v0_to_v1(session)
         await migrate_v1_to_v2(session)
+        await migrate_v2_to_v3(session)
     except Exception as e:
         logger.error("Migration failed", error=str(e))
         raise

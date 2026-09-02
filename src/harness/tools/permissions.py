@@ -6,6 +6,7 @@ Aligned with Claude Code's permission model:
 - Minimal structure, no separate Guard classes
 """
 
+import fnmatch
 import re
 import shlex
 from dataclasses import dataclass, field, replace
@@ -57,10 +58,10 @@ class PermissionScope:
         """Build a PermissionScope from app settings.
 
         Reads get_app_settings().get("permissions", {}) with Claude Code format:
-        - allow: list of allowed tools
-        - deny: list of denied tools
-        - ask: list of tools requiring approval
-        - patterns: dict mapping tool -> patterns to deny (e.g., {"Read": ["Read(.env*)"]})
+        - allow: list of allowed tools (no pattern checking)
+        - ask: list of tools requiring approval (no pattern checking)
+        - deny: list of tools with specific path patterns to block
+        - patterns: dict mapping tool -> glob patterns to deny (e.g., {"Read": [".env*", ".git/*"]})
         - alwaysAsk: list of tools always requiring approval
         - defaultMode: "auto", "strict", or "permissive"
         """

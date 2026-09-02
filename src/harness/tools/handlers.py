@@ -142,6 +142,7 @@ async def ask_user_question(
     questions: list[dict] | None = None,
     multi_select: bool = False,
     preview: dict | None = None,
+    overview: str = "",
 ) -> str:
     """Ask the user a multiple-choice question.
 

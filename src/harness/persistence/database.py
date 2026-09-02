@@ -4,6 +4,7 @@ Phase 0 foundation: all persistence layers depend on this.
 """
 
 import logging
+from pathlib import Path
 from contextlib import asynccontextmanager
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
@@ -11,10 +12,8 @@ from sqlalchemy.ext.asyncio import (
     async_sessionmaker,
 )
 from sqlalchemy.pool import StaticPool
-from sqlalchemy.event import listens_for
-from sqlalchemy import text, event
+from sqlalchemy import event
 
-from harness.config import get_settings
 from harness.persistence.models import Base
 
 logger = logging.getLogger(__name__)
@@ -29,42 +28,40 @@ def _sqlite_pragma_setup(dbapi_conn, connection_record):
     cursor.execute("PRAGMA journal_mode=WAL")  # Write-ahead logging for concurrent read
     cursor.execute("PRAGMA busy_timeout=5000")  # 5 second timeout on lock contention
     cursor.execute("PRAGMA foreign_keys=ON")   # Enforce foreign key constraints
+    cursor.execute("PRAGMA cache_size=50000")  # 50MB page cache for performance
     cursor.close()
 
 
 async def init_db():
     """Initialize database: create engine, apply pragmas, create all tables.
 
+    Database location: ~/.code/harness.db (user-level, shared across projects)
     Call once at startup. Safe to call multiple times (idempotent).
     """
     global _engine, _async_session_maker
 
-    # Idempotent: if already initialized, do nothing. Many entry points call
-    # init_db() defensively at startup; only the first call builds the engine.
     if _engine is not None:
         return
 
-    settings = get_settings()
-    
     try:
-        # Create async engine
-        if settings.database_url.startswith("sqlite"):
-            # SQLite-specific: StaticPool to avoid concurrency issues
-            _engine = create_async_engine(
-                settings.database_url,
-                echo=False,
-                poolclass=StaticPool,
-                connect_args={"timeout": 5.0, "check_same_thread": False},
-            )
-        else:
-            # PostgreSQL or other
-            _engine = create_async_engine(settings.database_url, echo=False)
+        # Resolve database path to ~/.code/harness.db (user-level)
+        db_path = Path.home() / ".code" / "harness.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Attach pragma setup to every new connection (SQLite only)
-        if settings.database_url.startswith("sqlite"):
-            @event.listens_for(_engine.sync_engine, "connect")
-            def receive_connect(dbapi_conn, connection_record):
-                _sqlite_pragma_setup(dbapi_conn, connection_record)
+        database_url = f"sqlite+aiosqlite:///{db_path}?timeout=30&check_same_thread=False"
+
+        # Create async engine with optimized pool config
+        _engine = create_async_engine(
+            database_url,
+            echo=False,
+            poolclass=StaticPool,
+            connect_args={"timeout": 5.0, "check_same_thread": False},
+        )
+
+        # Attach pragma setup to every new connection
+        @event.listens_for(_engine.sync_engine, "connect")
+        def receive_connect(dbapi_conn, connection_record):
+            _sqlite_pragma_setup(dbapi_conn, connection_record)
 
         # Create async session maker
         _async_session_maker = async_sessionmaker(
@@ -78,14 +75,15 @@ async def init_db():
         async with _engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
 
-        # Apply schema migrations (Phase 1: add working + episodic memory columns)
+        # Apply schema migrations
         async with _async_session_maker() as session:
             from harness.persistence.migrations import apply_migrations
             await apply_migrations(session)
 
-        logger.info(f"Database initialized: {settings.database_url}")
+        logger.info(f"Database initialized at: {db_path}")
     except ConnectionError as e:
-        logger.error(f"Database initialized error wwith messages {e}")
+        logger.error(f"Database initialization error: {e}")
+        raise
 
 
 @asynccontextmanager

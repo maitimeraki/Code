@@ -321,7 +321,12 @@ class TerminalUI:
             return "denied"
 
     def _validate_questions(self, questions: Optional[list]) -> list:
-        """Ensure questions structure is valid, return safe default if not."""
+        """Ensure questions structure is valid, return safe default if not.
+
+        Preserves `header` (used as the tab label) and `overview` (used as the
+        picker's intro line) alongside question/options — dropping them here is
+        what previously forced tabs to fall back to "Question 1/2/…".
+        """
         if not questions or not isinstance(questions, list):
             return [{"question": "No question provided", "options": []}]
         validated = []
@@ -331,10 +336,19 @@ class TerminalUI:
             opts = q.get("options", [])
             if not isinstance(opts, list):
                 opts = []
-            validated.append({
+            entry = {
                 "question": q.get("question", "Question"),
                 "options": opts,
-            })
+            }
+            header = q.get("header") or q.get("label")
+            if header:
+                entry["header"] = str(header)
+            overview = q.get("overview")
+            if overview:
+                entry["overview"] = str(overview)
+            if q.get("multiSelect") is not None:
+                entry["multiSelect"] = bool(q.get("multiSelect"))
+            validated.append(entry)
         return validated or [{"question": "No question provided", "options": []}]
 
     # ── AskUserQuestion interactive picker ─────────────────────────────────

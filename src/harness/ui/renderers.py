@@ -387,10 +387,12 @@ class OutputRenderer:
         if not is_processing:
             return result
 
-        # Header: * Blinking... (both toggle with show_indicator for blink effect)
-        if show_indicator:
-            result.append("* ", style=Styles.TASK_DOT_BROWN)
-            result.append("Blinking...", style=Styles.WORKING_BLINK)
+        # Header: ✳ always drawn; label dims rather than vanishing.
+        result.append("✳ ", style=Styles.TASK_DOT_BROWN)
+        result.append(
+            "Running…",
+            style=Styles.WORKING_SOLID if show_indicator else Styles.WORKING_BLINK,
+        )
         result.append("\n")
 
         # Awaiting-approval banner — shown whenever the agent is parked on a picker.
@@ -558,7 +560,7 @@ class OutputRenderer:
 
         # ── Tabs row ────────────────────────────────────────────
         if not submitted:
-            tab_labels = [q.get("label", f"Question {i+1}")
+            tab_labels = [q.get("header") or q.get("label") or f"Question {i+1}"
                           for i, q in enumerate(questions)]
             tab_labels.append("Submit")
             for ti, label in enumerate(tab_labels):
