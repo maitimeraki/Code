@@ -4,7 +4,7 @@
 
 Built like Claude Code: an interactive Rich terminal UI plus a full CLI, all in one installable Python package (Python ≥ 3.11).
 
-[![Watch the video]](./Code-demo.mp4)
+<video src="[PASTE_YOUR_GITHUB_VIDEO_URL_HERE](https://github.com/maitimeraki/Code/blob/main/Code-demo.mp4)" autoplay loop muted playsinline width="100%"></video>
 
 ---
 
